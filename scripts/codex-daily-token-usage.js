@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Codex Daily Token Usage
 // @namespace    codex-plus-plus
-// @version      1.4.5
+// @version      1.4.6
 // @description  每日 Token 统计，近 5 日滚动存储，优先复用已有采集，必要时内置采集，支持 Model 价格、成本估算、日期切换、5 日趋势与分享图。
 // @match        app://-/*
 // @run-at       document-start
@@ -10,7 +10,7 @@
 (() => {
   "use strict";
 
-  const VERSION = "1.4.5";
+  const VERSION = "1.4.6";
   const API_KEY = "__codexDailyTokenUsage";
   const SOURCE_API_KEY = "__codexTokenUsage";
   const STORAGE_KEY = "__codexDailyTokenUsageV1";
@@ -29,7 +29,12 @@
   const UNKNOWN_MODEL = "Unknown";
   const PRICE_FIELDS = ["input", "cachedInput", "output", "reasoning"];
   const FLOATING_TOP = 2;
-  const FLOATING_RIGHT = 280;
+  const FLOATING_DEFAULT_RIGHT = 280;
+  const FLOATING_FALLBACK_RIGHT = 12;
+  const FLOATING_SAFE_GAP = 8;
+  const FLOATING_SCAN_TOP = 96;
+  const FLOATING_MIN_WIDTH = 94;
+  const FLOATING_HEIGHT = 31;
   const PANEL_GAP = 8;
   const PANEL_MARGIN = 12;
   const WINDOW_BUTTON_SAFE_RIGHT = 132;
@@ -1551,7 +1556,7 @@
       #${ROOT_ID}.codex-daily-floating {
         position: fixed;
         top: ${FLOATING_TOP}px;
-        right: ${FLOATING_RIGHT}px;
+        right: ${FLOATING_DEFAULT_RIGHT}px;
         bottom: auto;
         left: auto;
       }
@@ -2471,6 +2476,95 @@
     hidePanel();
   }
 
+  function normalizeRect(rect) {
+    if (!rect) return null;
+    const left = Number(rect.left);
+    const top = Number(rect.top);
+    const right = Number(rect.right);
+    const bottom = Number(rect.bottom);
+    if (![left, top, right, bottom].every(Number.isFinite)) return null;
+    const width = Math.max(0, right - left);
+    const height = Math.max(0, bottom - top);
+    if (!width || !height) return null;
+    return { left, top, right, bottom, width, height };
+  }
+
+  function rectsOverlap(first, second, gap = 0) {
+    return (
+      first.left < second.right + gap &&
+      first.right > second.left - gap &&
+      first.top < second.bottom + gap &&
+      first.bottom > second.top - gap
+    );
+  }
+
+  function candidateRectFromRight(right, top, width, height, viewportWidth) {
+    const left = viewportWidth - right - width;
+    return { left, right: left + width, top, bottom: top + height, width, height };
+  }
+
+  function resolveFloatingLayout(width, height, viewportWidth, viewportHeight, obstacleRects = []) {
+    const safeWidth = Math.min(Math.max(1, Number(width) || FLOATING_MIN_WIDTH), Math.max(1, viewportWidth - PANEL_MARGIN * 2));
+    const safeHeight = Math.max(1, Number(height) || FLOATING_HEIGHT);
+    const top = FLOATING_TOP;
+    const maxRight = Math.max(PANEL_MARGIN, viewportWidth - PANEL_MARGIN - safeWidth);
+    const clampRight = (right) => Math.min(Math.max(PANEL_MARGIN, right), maxRight);
+    const topObstacles = obstacleRects
+      .map(normalizeRect)
+      .filter((rect) => rect && rect.bottom > 0 && rect.top < FLOATING_SCAN_TOP && rect.right > 0 && rect.left < viewportWidth);
+    const defaultRight = clampRight(FLOATING_DEFAULT_RIGHT);
+    const defaultRect = candidateRectFromRight(defaultRight, top, safeWidth, safeHeight, viewportWidth);
+    if (!topObstacles.some((rect) => rectsOverlap(defaultRect, rect, FLOATING_SAFE_GAP))) {
+      return { top, right: defaultRight, left: defaultRect.left, placedBelow: false };
+    }
+
+    const blocked = topObstacles
+      .map((rect) => ({
+        left: Math.max(PANEL_MARGIN, rect.left - FLOATING_SAFE_GAP),
+        right: Math.min(viewportWidth - PANEL_MARGIN, rect.right + FLOATING_SAFE_GAP),
+      }))
+      .sort((a, b) => a.left - b.left);
+    let cursor = PANEL_MARGIN;
+    const gaps = [];
+    for (const rect of blocked) {
+      if (rect.left > cursor) gaps.push({ left: cursor, right: rect.left });
+      cursor = Math.max(cursor, rect.right);
+    }
+    if (cursor < viewportWidth - PANEL_MARGIN) gaps.push({ left: cursor, right: viewportWidth - PANEL_MARGIN });
+
+    const topGap = gaps
+      .filter((gap) => gap.right - gap.left >= safeWidth)
+      .sort((a, b) => b.right - a.right)[0];
+    if (topGap) {
+      const left = topGap.right - safeWidth;
+      return { top, right: viewportWidth - left - safeWidth, left, placedBelow: false };
+    }
+
+    const obstacleBottom = topObstacles.reduce((max, rect) => Math.max(max, rect.bottom), top + safeHeight);
+    const maxTop = Math.max(PANEL_MARGIN, viewportHeight - safeHeight - PANEL_MARGIN);
+    const fallbackTop = Math.min(Math.max(top, obstacleBottom + FLOATING_SAFE_GAP), maxTop);
+    const fallbackRight = clampRight(FLOATING_FALLBACK_RIGHT);
+    const fallbackRect = candidateRectFromRight(fallbackRight, fallbackTop, safeWidth, safeHeight, viewportWidth);
+    return { top: fallbackTop, right: fallbackRight, left: fallbackRect.left, placedBelow: true };
+  }
+
+  function collectTopObstacleRects() {
+    if (!document.body?.querySelectorAll) return [];
+    const selector = "button,[role='button'],input,select,textarea,#codex-plus-menu,[data-testid]";
+    return Array.from(document.body.querySelectorAll(selector))
+      .filter((node) => !root?.contains(node) && !panel?.contains(node))
+      .map((node) => {
+        const rect = normalizeRect(node.getBoundingClientRect?.());
+        if (!rect || rect.width < 4 || rect.height < 4) return null;
+        if (rect.top >= FLOATING_SCAN_TOP || rect.bottom <= 0) return null;
+        if (rect.width > innerWidth * 0.85 || rect.height > FLOATING_SCAN_TOP) return null;
+        const style = typeof getComputedStyle === "function" ? getComputedStyle(node) : null;
+        if (style && (style.display === "none" || style.visibility === "hidden" || style.opacity === "0")) return null;
+        return rect;
+      })
+      .filter(Boolean);
+  }
+
   function findToolbar() {
     return null;
 
@@ -2518,11 +2612,20 @@
     if (root.parentElement !== document.body) {
       document.body.appendChild(root);
     }
-    root.style.top = `${FLOATING_TOP}px`;
-    root.style.right = `${FLOATING_RIGHT}px`;
+    const rect = root.getBoundingClientRect();
+    const layout = resolveFloatingLayout(
+      rect.width || FLOATING_MIN_WIDTH,
+      rect.height || FLOATING_HEIGHT,
+      innerWidth,
+      innerHeight,
+      collectTopObstacleRects()
+    );
+    root.style.top = `${Math.round(layout.top)}px`;
+    root.style.right = `${Math.round(layout.right)}px`;
     root.style.left = "auto";
     root.style.bottom = "auto";
     root.style.transform = "none";
+    root.dataset.layout = layout.placedBelow ? "below-toolbar" : "top-toolbar";
     if (panel?.classList.contains("is-visible")) positionPanel();
   }
 
@@ -2787,6 +2890,8 @@
       trendPoints,
       trendPath,
       buildShareModel,
+      resolveFloatingLayout,
+      rectsOverlap,
       findUsageCandidates,
       processCapturePayload,
       processModelPayload,
