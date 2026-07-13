@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Codex Daily Token Usage
 // @namespace    codex-plus-plus
-// @version      1.4.13
-// @description  每日 Token 统计，近 5 日滚动存储，优先复用已有采集，必要时内置采集，支持 Model 价格、成本估算、日期切换、5 日趋势与分享图。
+// @version      1.5.0
+// @description  每日 Token 统计，按 Codex 原生 token_count 的单次请求用量准确累计，近 5 日滚动存储，支持 Model 价格、成本估算、日期切换、5 日趋势与分享图。
 // @match        app://-/*
 // @run-at       document-start
 // ==/UserScript==
@@ -10,7 +10,7 @@
 (() => {
   "use strict";
 
-  const VERSION = "1.4.13";
+  const VERSION = "1.5.0";
   const API_KEY = "__codexDailyTokenUsage";
   const SOURCE_API_KEY = "__codexTokenUsage";
   const STORAGE_KEY = "__codexDailyTokenUsageV1";
@@ -32,6 +32,8 @@
   const MAX_TOOL_CALL_EVENTS_PER_DAY = 3000;
   const TOOL_USAGE_MATCH_WINDOW_MS = 15 * 60 * 1000;
   const CAPTURE_DEDUPE_WINDOW_MS = 3000;
+  const USAGE_ACCURACY_REVISION = 2;
+  const NATIVE_USAGE_SOURCE = "native-token-count";
   const TOOL_CALL_DEDUPE_WINDOW_MS = 3000;
   const MAX_CAPTURE_BODY_CHARS = 2_000_000;
   const EXTERNAL_EMPTY_LIMIT = 4;
@@ -152,7 +154,13 @@
   let lastDateKey = getDateKey(Date.now());
   let selectedDateKey = lastDateKey;
   let state = loadState();
-  if (pruneState()) saveState();
+  const stateMigrated = migrateUsageAccuracyState();
+  let nativeDaysActivated = false;
+  for (let dayOffset = 0; dayOffset < RETAIN_DAYS; dayOffset += 1) {
+    nativeDaysActivated =
+      activateNativeUsageForDay(shiftDateKey(lastDateKey, -dayOffset)) || nativeDaysActivated;
+  }
+  if (pruneState() || stateMigrated || nativeDaysActivated) saveState();
   let priceConfig = loadPriceConfig();
   let lastObservedModel = "";
   let lastObservedModelAt = 0;
@@ -301,6 +309,7 @@
     );
     const output = firstCount(
       usage.outputTotalTokens,
+      usage.output_total_tokens,
       usage.outputTokens,
       usage.output_tokens,
       usage.completionTokens,
@@ -320,20 +329,23 @@
       usage.input_tokens_details?.cached_tokens
     );
     const reasoning = firstCount(
+      usage.reasoningOutputTokens,
+      usage.reasoning_output_tokens,
       usage.reasoningTokens,
       usage.reasoning_tokens,
       usage.outputTokensDetails?.reasoningTokens,
       usage.output_tokens_details?.reasoning_tokens
     );
-    const total = firstCount(
+    const reportedTotal = firstCount(
       usage.requestTotalTokens,
       usage.totalTokens,
       usage.total_tokens,
       usage.usedTokens,
       usage.used_tokens,
-      usage.used,
-      input + output
+      usage.used
     );
+    const calculatedTotal = input + output;
+    const total = calculatedTotal > 0 ? calculatedTotal : reportedTotal;
 
     return { input, output, cached, reasoning, total };
   }
@@ -605,7 +617,7 @@
   }
 
   function createEmptyState() {
-    return { version: 1, days: {} };
+    return { version: 1, usageAccuracyRevision: USAGE_ACCURACY_REVISION, days: {} };
   }
 
   function loadState() {
@@ -618,6 +630,18 @@
       // 损坏或不可访问的本地数据按空状态处理。
     }
     return createEmptyState();
+  }
+
+  function migrateUsageAccuracyState() {
+    if (toCount(state?.usageAccuracyRevision) >= USAGE_ACCURACY_REVISION) return false;
+
+    for (const day of Object.values(state.days || {})) {
+      if (!day || typeof day !== "object") continue;
+      day.turns = {};
+      day.nativeUsageActive = true;
+    }
+    state.usageAccuracyRevision = USAGE_ACCURACY_REVISION;
+    return true;
   }
 
   function saveState() {
@@ -811,6 +835,28 @@
         changed = true;
       }
     }
+    return changed;
+  }
+
+  function isNativeUsageTurn(turn) {
+    return String(turn?.source || "") === NATIVE_USAGE_SOURCE;
+  }
+
+  function dayUsesNativeUsage(dateKey) {
+    return state.days?.[dateKey]?.nativeUsageActive === true;
+  }
+
+  function activateNativeUsageForDay(dateKey) {
+    const day = state.days[dateKey] || { turns: {}, updatedAt: 0 };
+    if (!day.turns || typeof day.turns !== "object") day.turns = {};
+    let changed = day.nativeUsageActive !== true;
+    for (const [turnId, turn] of Object.entries(day.turns)) {
+      if (isNativeUsageTurn(turn)) continue;
+      delete day.turns[turnId];
+      changed = true;
+    }
+    day.nativeUsageActive = true;
+    state.days[dateKey] = day;
     return changed;
   }
 
@@ -1769,22 +1815,37 @@
   function extractCandidateId(value) {
     if (!value || typeof value !== "object") return "";
     const candidates = [
+      value.turn_id,
+      value.turnId,
       value.response_id,
       value.responseId,
+      value.response?.id,
       value.request_id,
       value.requestId,
-      value.event_id,
-      value.eventId,
       value.message_id,
       value.messageId,
-      value.id,
-      value.response?.id,
       value.message?.id,
       value.data?.id,
       value.result?.id,
+      value.id,
+      value.event_id,
+      value.eventId,
     ];
     const id = candidates.find((candidate) => typeof candidate === "string" && candidate.trim());
     return id ? id.trim() : "";
+  }
+
+  function extractCaptureTimestamp(value) {
+    if (!value || typeof value !== "object") return null;
+    return parseTimestamp(
+      value.timestamp ??
+        value.created_at ??
+        value.createdAt ??
+        value.observed_at ??
+        value.observedAt ??
+        value.updated_at ??
+        value.updatedAt
+    );
   }
 
   function normalizeCaptureUsage(rawUsage) {
@@ -1793,38 +1854,77 @@
     return usage;
   }
 
-  function findUsageCandidates(value, depth = 0, inheritedId = "", inheritedModel = "") {
+  function findUsageCandidates(
+    value,
+    depth = 0,
+    inheritedId = "",
+    inheritedModel = "",
+    inheritedConversationKey = "",
+    inheritedTimestamp = null
+  ) {
     if (!value || depth > 8) return [];
     if (typeof value === "string") {
-      return parseTextPayloads(value).flatMap((item) => findUsageCandidates(item, depth + 1, inheritedId, inheritedModel));
+      return parseTextPayloads(value).flatMap((item) =>
+        findUsageCandidates(
+          item,
+          depth + 1,
+          inheritedId,
+          inheritedModel,
+          inheritedConversationKey,
+          inheritedTimestamp
+        )
+      );
     }
     if (Array.isArray(value)) {
-      return value.flatMap((item) => findUsageCandidates(item, depth + 1, inheritedId, inheritedModel));
+      return value.flatMap((item) =>
+        findUsageCandidates(
+          item,
+          depth + 1,
+          inheritedId,
+          inheritedModel,
+          inheritedConversationKey,
+          inheritedTimestamp
+        )
+      );
     }
     if (typeof value !== "object") return [];
 
     const id = extractCandidateId(value) || inheritedId;
     const model = extractDirectModel(value) || inheritedModel;
+    const conversationKey = extractConversationKey(value) || inheritedConversationKey;
+    const timestamp = extractCaptureTimestamp(value) || inheritedTimestamp;
     const candidates = [];
     const directKeys = [
       "usage",
       "token_usage",
       "tokenUsage",
-      "context_usage",
-      "contextUsage",
+      "last",
       "last_usage",
       "lastUsage",
       "last_token_usage",
       "lastTokenUsage",
+      "turn_usage",
+      "turnUsage",
+      "request_usage",
+      "requestUsage",
     ];
 
     for (const key of directKeys) {
-      const usage = normalizeCaptureUsage(value[key]);
-      if (usage) candidates.push({ usage, id, model });
+      const nested = value[key];
+      const usage = normalizeCaptureUsage(nested);
+      if (usage) {
+        candidates.push({ usage, id, model, conversationKey, timestamp });
+      } else if (nested && typeof nested === "object") {
+        candidates.push(
+          ...findUsageCandidates(nested, depth + 1, id, model, conversationKey, timestamp)
+        );
+      }
     }
 
-    const selfUsage = normalizeCaptureUsage(value);
-    if (selfUsage) candidates.push({ usage: selfUsage, id, model });
+    if (!candidates.length) {
+      const selfUsage = normalizeCaptureUsage(value);
+      if (selfUsage) candidates.push({ usage: selfUsage, id, model, conversationKey, timestamp });
+    }
 
     for (const key of [
       "response",
@@ -1841,7 +1941,9 @@
       "details",
       "info",
     ]) {
-      candidates.push(...findUsageCandidates(value[key], depth + 1, id, model));
+      candidates.push(
+        ...findUsageCandidates(value[key], depth + 1, id, model, conversationKey, timestamp)
+      );
     }
 
     return dedupeCandidates(candidates);
@@ -1865,6 +1967,110 @@
       seen.add(key);
       return true;
     });
+  }
+
+  function findNativeTokenUsageEvents(
+    value,
+    depth = 0,
+    inheritedConversationKey = "",
+    inheritedModel = "",
+    inheritedTimestamp = null
+  ) {
+    if (!value || depth > 8) return [];
+    if (typeof value === "string") {
+      return dedupeCandidates(
+        parseTextPayloads(value).flatMap((item) =>
+          findNativeTokenUsageEvents(
+            item,
+            depth + 1,
+            inheritedConversationKey,
+            inheritedModel,
+            inheritedTimestamp
+          )
+        )
+      );
+    }
+    if (Array.isArray(value)) {
+      return dedupeCandidates(
+        value.flatMap((item) =>
+          findNativeTokenUsageEvents(
+            item,
+            depth + 1,
+            inheritedConversationKey,
+            inheritedModel,
+            inheritedTimestamp
+          )
+        )
+      );
+    }
+    if (typeof value !== "object") return [];
+
+    const conversationKey = extractConversationKey(value) || inheritedConversationKey;
+    const model = extractDirectModel(value) || inheritedModel;
+    const timestamp = extractCaptureTimestamp(value) || inheritedTimestamp;
+    const type = String(value.type || "").toLowerCase();
+    const method = String(value.method || value.request?.method || "").toLowerCase();
+    const isNativeTokenEvent =
+      type === "token_count" ||
+      type === "token-count" ||
+      type === "thread/tokenusage/updated" ||
+      method === "thread/tokenusage/updated";
+    const events = [];
+
+    if (isNativeTokenEvent) {
+      const params = value.params || value.request?.params || {};
+      const container =
+        value.info ||
+        value.tokenUsage ||
+        value.token_usage ||
+        params.tokenUsage ||
+        params.token_usage ||
+        params.info ||
+        params;
+      const lastRaw =
+        container?.last_token_usage ||
+        container?.lastTokenUsage ||
+        container?.last_usage ||
+        container?.lastUsage ||
+        container?.last;
+      const totalRaw =
+        container?.total_token_usage ||
+        container?.totalTokenUsage ||
+        container?.total_usage ||
+        container?.totalUsage ||
+        container?.total;
+      const usage = normalizeCaptureUsage(lastRaw);
+
+      if (usage) {
+        const cumulative = normalizeUsage(totalRaw);
+        const eventId = extractCandidateId(value);
+        const identity = conversationKey || eventId || `${model || UNKNOWN_MODEL}|${usageSignature(usage)}`;
+        const cumulativeSignature = cumulative.total
+          ? usageSignature(cumulative)
+          : `${usageSignature(usage)}|${timestamp ? Math.floor(timestamp / 1000) : ""}`;
+        events.push({
+          usage,
+          id: `native:${shortHash(identity)}:${cumulative.total || usage.total}:${shortHash(cumulativeSignature)}`,
+          model,
+          conversationKey,
+          timestamp,
+          cumulative,
+        });
+      }
+    }
+
+    for (const key of ["response", "data", "body", "message", "result", "event", "params", "payload"]) {
+      events.push(
+        ...findNativeTokenUsageEvents(
+          value[key],
+          depth + 1,
+          conversationKey,
+          model,
+          timestamp
+        )
+      );
+    }
+    return dedupeCandidates(events);
   }
 
   function firstToolName(...values) {
@@ -2114,10 +2320,12 @@
     const signature = usageSignature(candidate.usage);
     const dedupeKey = candidate.id
       ? `id:${candidate.id}|${signature}`
-      : `near:${signature}|${Math.floor(now / CAPTURE_DEDUPE_WINDOW_MS)}`;
-    if (recentCaptureKeys.has(dedupeKey)) return false;
+      : `near:${candidate.conversationKey || ""}|${signature}`;
+    const previousCaptureAt = recentCaptureKeys.get(dedupeKey);
+    if (previousCaptureAt && now - previousCaptureAt <= CAPTURE_DEDUPE_WINDOW_MS) return false;
     recentCaptureKeys.set(dedupeKey, now);
 
+    const timestamp = candidate.timestamp || now;
     const turnId = candidate.id
       ? `capture:${candidate.id}`
       : `${now}-${++captureSeq}`;
@@ -2126,7 +2334,8 @@
       model: candidate.model,
       source: `capture:${source}`,
       callCount: 1,
-      createdAt: new Date(now).toISOString(),
+      createdAt: new Date(timestamp).toISOString(),
+      conversationKey: candidate.conversationKey,
       usage: {
         inputTokens: candidate.usage.input,
         outputTokens: candidate.usage.output,
@@ -2143,6 +2352,49 @@
       sourceMode = "standalone";
     }
     return changed;
+  }
+
+  function rememberNativeTokenUsage(candidate) {
+    const timestamp = candidate.timestamp || Date.now();
+    const dateKey = getDateKey(timestamp);
+    const activated = activateNativeUsageForDay(dateKey);
+    const changed = upsertTurn({
+      turnId: candidate.id,
+      model: candidate.model,
+      source: NATIVE_USAGE_SOURCE,
+      callCount: 1,
+      createdAt: new Date(timestamp).toISOString(),
+      conversationKey: candidate.conversationKey,
+      usage: {
+        inputTokens: candidate.usage.input,
+        outputTokens: candidate.usage.output,
+        cachedReadTokens: candidate.usage.cached,
+        reasoningOutputTokens: candidate.usage.reasoning,
+        totalTokens: candidate.usage.total,
+        hasBreakdown: true,
+      },
+    });
+    if (changed || activated) {
+      lastCaptureAt = Date.now();
+      sourceMode = "native";
+    }
+    return changed || activated;
+  }
+
+  function processNativeTokenUsagePayload(payload) {
+    const events = findNativeTokenUsageEvents(payload);
+    if (!events.length) return { matched: false, changed: false };
+
+    let changed = false;
+    for (const event of events) {
+      changed = rememberNativeTokenUsage(event) || changed;
+    }
+    if (changed) {
+      pruneState();
+      saveState();
+      render({ animate: true });
+    }
+    return { matched: true, changed };
   }
 
   function processToolCallPayload(payload, source = "capture") {
@@ -2287,8 +2539,10 @@
 
   function processCapturePayload(payload, source, url = "") {
     const toolChanged = processToolCallPayload(payload, source);
-    if (sourceMode === "external") return toolChanged;
     processModelPayload(payload, false);
+    const nativeResult = processNativeTokenUsagePayload(payload);
+    if (nativeResult.matched) return nativeResult.changed || toolChanged;
+    if (sourceMode === "external" || sourceMode === "native") return toolChanged;
     const candidates = findUsageCandidates(payload);
     if (!candidates.length) return toolChanged;
     let changed = false;
@@ -2301,10 +2555,6 @@
       render({ animate: true });
     }
     return changed || toolChanged;
-  }
-
-  function shouldProcessStandalonePayload() {
-    return sourceMode !== "external" && (captureInstalled || !externalSourceAvailable());
   }
 
   function processModelPayload(payload, recordTools = true) {
@@ -2332,11 +2582,7 @@
       "codex-message-from-view",
       (event) => {
         try {
-          if (shouldProcessStandalonePayload()) {
-            processCapturePayload(event.detail, "codex-message");
-          } else {
-            processModelPayload(event.detail);
-          }
+          processCapturePayload(event.detail, "codex-message");
         } catch {
           // 不影响 Codex 自身消息投递。
         }
@@ -2347,7 +2593,7 @@
       "message",
       (event) => {
         try {
-          processModelPayload(event.data);
+          processCapturePayload(event.data, "post-message-passive");
         } catch {
           // Ignore unrelated messages.
         }
@@ -2516,8 +2762,13 @@
   function syncFromSource() {
     let changed = false;
     const externalTurns = readExternalTurns();
+    const nativeActiveToday = dayUsesNativeUsage(getDateKey(Date.now()));
 
-    if (externalTurns.length > 0) {
+    if (nativeActiveToday) {
+      sourceMode = "native";
+      externalEmptyCount = 0;
+      if (captureInstalled) restoreStandaloneCapture();
+    } else if (externalTurns.length > 0) {
       sourceMode = "external";
       externalEmptyCount = 0;
       if (captureInstalled) restoreStandaloneCapture();
@@ -2528,10 +2779,12 @@
     }
 
     for (const turn of externalTurns) {
+      const timestamp = getTurnTimestamp(turn);
+      if (timestamp && dayUsesNativeUsage(getDateKey(timestamp))) continue;
       changed = upsertTurn(turn) || changed;
     }
 
-    if (shouldInstallStandaloneCapture(externalTurns)) {
+    if (!nativeActiveToday && shouldInstallStandaloneCapture(externalTurns)) {
       installStandaloneCapture();
     }
 
@@ -2631,6 +2884,8 @@
       #${PANEL_ID} {
         position: fixed;
         width: min(350px, calc(100vw - 24px));
+        max-height: calc(100vh - 24px);
+        max-height: calc(100dvh - 24px);
         box-sizing: border-box;
         padding: 14px;
         border: 1px solid var(--color-token-border, rgba(127, 127, 127, 0.24));
@@ -2638,6 +2893,10 @@
         color: var(--color-token-foreground, #202020);
         background: var(--color-token-background, #ffffff);
         box-shadow: 0 14px 40px rgba(0, 0, 0, 0.18);
+        overflow-x: hidden;
+        overflow-y: auto;
+        overscroll-behavior: contain;
+        scrollbar-gutter: stable;
         opacity: 0;
         visibility: hidden;
         transform: translateY(-4px);
@@ -3089,8 +3348,7 @@
       #${PANEL_ID} .codex-daily-price-list {
         display: grid;
         gap: 9px;
-        max-height: 260px;
-        overflow: auto;
+        overflow: visible;
         padding-right: 2px;
       }
       #${PANEL_ID} .codex-daily-price-row {
@@ -4041,8 +4299,11 @@
   }
 
   function sourceStatusText(snapshot) {
+    if (sourceMode === "native") {
+      return `${snapshot.turns} 次模型请求 · Codex 原生 token_count`;
+    }
     if (sourceMode === "external") {
-      return `${snapshot.turns} 个 turn · 复用 Codex Token Usage`;
+      return `${snapshot.turns} 个 turn · 等待原生 token_count`;
     }
     if (sourceMode === "standalone") {
       return `${snapshot.turns} 个 turn · 本机累计 · 独立采集`;
@@ -4164,7 +4425,8 @@
     const totalChanged = lastRenderedTotal >= 0 && todaySnapshot.total !== lastRenderedTotal;
     lastRenderedTotal = todaySnapshot.total;
 
-    const connected = sourceMode === "external" || sourceMode === "standalone";
+    const connected =
+      sourceMode === "native" || sourceMode === "external" || sourceMode === "standalone";
     root.classList.toggle("is-connected", connected);
     panel?.classList.toggle("is-connected", connected);
     root.querySelector(".codex-daily-total").textContent = formatCompact(todaySnapshot.total);
@@ -4210,6 +4472,7 @@
       const wasViewingToday = selectedDateKey === lastDateKey;
       lastDateKey = getDateKey(Date.now());
       if (wasViewingToday) selectedDateKey = lastDateKey;
+      activateNativeUsageForDay(lastDateKey);
       pruneState();
       saveState();
       render();
@@ -4225,6 +4488,7 @@
       const wasViewingToday = selectedDateKey === lastDateKey;
       lastDateKey = currentDateKey;
       if (wasViewingToday) selectedDateKey = currentDateKey;
+      activateNativeUsageForDay(currentDateKey);
       pruneState();
       saveState();
     }
@@ -4323,6 +4587,10 @@
       resolveFloatingLayout,
       rectsOverlap,
       findUsageCandidates,
+      findNativeTokenUsageEvents,
+      processNativeTokenUsagePayload,
+      activateNativeUsageForDay,
+      dayUsesNativeUsage,
       processCapturePayload,
       processModelPayload,
       syncFromSource,
