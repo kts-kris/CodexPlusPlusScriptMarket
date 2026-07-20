@@ -3377,6 +3377,10 @@
         max-height: calc(100dvh - 24px);
         box-sizing: border-box;
         padding: 14px;
+        overflow-x: hidden;
+        overflow-y: auto;
+        overscroll-behavior: contain;
+        scrollbar-gutter: stable;
         border: 1px solid var(--color-token-border, rgba(127, 127, 127, 0.24));
         border-radius: 12px;
         color: var(--color-token-foreground, #202020);
@@ -4215,6 +4219,7 @@
     const pricePanel = panel.querySelector(".codex-daily-price-panel");
     if (pricePanel) pricePanel.hidden = false;
     panel.querySelector('[data-action="toggle-prices"]')?.setAttribute("aria-expanded", "true");
+    if (panel.classList.contains("is-visible")) positionPanel();
   }
 
   function handlePriceInput(event) {
@@ -4441,6 +4446,7 @@
 
   function positionPanel() {
     if (!root || !panel) return;
+    panel.style.maxHeight = `${Math.max(160, innerHeight - PANEL_MARGIN * 2)}px`;
     const rect = root.getBoundingClientRect();
     const panelRect = panel.getBoundingClientRect();
     const panelWidth = panelRect.width || Math.min(350, innerWidth - PANEL_MARGIN * 2);
@@ -4452,6 +4458,7 @@
     const preferredTop = rect.bottom + PANEL_GAP;
     const maxTop = Math.max(PANEL_MARGIN, innerHeight - panelHeight - PANEL_MARGIN);
     const top = Math.min(Math.max(PANEL_MARGIN, preferredTop), maxTop);
+    panel.style.maxHeight = `${Math.max(160, innerHeight - top - PANEL_MARGIN)}px`;
     panel.style.top = `${Math.round(top)}px`;
     panel.style.left = `${Math.round(left)}px`;
     panel.style.right = "auto";
