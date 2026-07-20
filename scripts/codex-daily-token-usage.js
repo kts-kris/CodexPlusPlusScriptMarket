@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Codex Daily Token Usage
 // @namespace    codex-plus-plus
-// @version      1.4.15
+// @version      1.4.16
 // @description  每日 Token 统计，近 5 日滚动存储，优先复用已有采集，必要时回填本机历史 session，支持 Model 价格、成本估算、日期切换、5 日趋势与分享图。
 // @match        app://-/*
 // @run-at       document-start
@@ -10,7 +10,7 @@
 (() => {
   "use strict";
 
-  const VERSION = "1.4.15";
+  const VERSION = "1.4.16";
   const API_KEY = "__codexDailyTokenUsage";
   const SOURCE_API_KEY = "__codexTokenUsage";
   const STORAGE_KEY = "__codexDailyTokenUsageV1";
@@ -119,13 +119,9 @@
     "gpt-3.5-turbo-16k-0613": { input: 3, output: 4 },
     "davinci-002": { input: 2, output: 2 },
     "babbage-002": { input: 0.4, output: 0.4 },
-    "gpt-5.5-cyber": { input: 12.5, cachedInput: 1.25, output: 75 },
     "gpt-5-search-api": { input: 1.25, cachedInput: 0.125, output: 10 },
     "gpt-4o-search-preview": { input: 2.5, output: 10 },
     "gpt-4o-mini-search-preview": { input: 0.15, output: 0.6 },
-    "o3-deep-research": { input: 10, cachedInput: 2.5, output: 40 },
-    "o4-mini-deep-research": { input: 2, cachedInput: 0.5, output: 8 },
-    "computer-use-preview": { input: 3, output: 12 },
   });
   const FLOATING_TOP = 2;
   const FLOATING_DEFAULT_RIGHT = 280;
@@ -3935,7 +3931,7 @@
             <span class="codex-daily-section-title">Model 价格设置</span>
             <span class="codex-daily-section-meta">USD / 1M tokens</span>
           </div>
-          <div class="codex-daily-price-help">内置 OpenAI API Pricing 的 Standard 参考价，单位 USD / 1M tokens；有上下文分档的模型按短上下文价预置。用户输入会覆盖预置字段。Cache writes、工具调用按次费用、Batch/Flex/Priority 不纳入估算。价格只用于本地估算，不代表官方账单。</div>
+          <div class="codex-daily-price-help">内置 OpenAI API Pricing 的 Standard 参考价，单位 USD / 1M tokens；有上下文分档的模型按短上下文价预置，官方未明确给出 Standard token 单价的模型不预置。用户输入会覆盖预置字段。Cache writes、工具调用按次费用、Batch/Flex/Priority 不纳入估算。价格只用于本地估算，不代表官方账单。</div>
           <div class="codex-daily-price-add">
             <input class="codex-daily-price-model-input" type="text" placeholder="添加 Model，例如 gpt-5.5" aria-label="添加 Model 名称">
             <button class="codex-daily-price-add-button" type="button" data-action="add-price-model">添加</button>
