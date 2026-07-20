@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Codex Daily Token Usage
 // @namespace    codex-plus-plus
-// @version      1.4.13
-// @description  每日 Token 统计，近 5 日滚动存储，优先复用已有采集，必要时内置采集，支持 Model 价格、成本估算、日期切换、5 日趋势与分享图。
+// @version      1.4.14
+// @description  每日 Token 统计，近 5 日滚动存储，优先复用已有采集，必要时回填本机历史 session，支持 Model 价格、成本估算、日期切换、5 日趋势与分享图。
 // @match        app://-/*
 // @run-at       document-start
 // ==/UserScript==
@@ -10,7 +10,7 @@
 (() => {
   "use strict";
 
-  const VERSION = "1.4.13";
+  const VERSION = "1.4.14";
   const API_KEY = "__codexDailyTokenUsage";
   const SOURCE_API_KEY = "__codexTokenUsage";
   const STORAGE_KEY = "__codexDailyTokenUsageV1";
@@ -35,6 +35,26 @@
   const TOOL_CALL_DEDUPE_WINDOW_MS = 3000;
   const MAX_CAPTURE_BODY_CHARS = 2_000_000;
   const EXTERNAL_EMPTY_LIMIT = 4;
+  const HISTORY_BACKFILL_INITIAL_DELAY_MS = 3500;
+  const HISTORY_BACKFILL_INTERVAL_MS = 10 * 60 * 1000;
+  const HISTORY_THREAD_SCAN_LIMIT = 200;
+  const HISTORY_THREAD_PAGE_LIMIT = 100;
+  const HISTORY_READ_CONCURRENCY = 3;
+  const HISTORY_ASSET_SCAN_LIMIT = 8;
+  const HISTORY_ASSET_SCAN_MAX_CHARS = 1_200_000;
+  const HISTORY_REQUEST_TIMEOUT_MS = 20000;
+  const HISTORY_THREAD_SOURCE_KINDS = Object.freeze([
+    "cli",
+    "vscode",
+    "exec",
+    "appServer",
+    "subAgent",
+    "subAgentReview",
+    "subAgentCompact",
+    "subAgentThreadSpawn",
+    "subAgentOther",
+    "unknown",
+  ]);
   const TREND_DAYS = 5;
   const MODEL_BIND_WINDOW_MS = 30 * 60 * 1000;
   const UNKNOWN_MODEL = "Unknown";
@@ -138,6 +158,7 @@
   let layoutRaf = 0;
   let pollTimer = null;
   let midnightTimer = null;
+  let historyBackfillTimer = null;
   let closeTimer = null;
   let shareFeedbackTimer = null;
   let pinnedOpen = false;
@@ -157,6 +178,11 @@
   let lastObservedModel = "";
   let lastObservedModelAt = 0;
   let lastObservedModelConfidence = "unknown";
+  let historyBackfillInFlight = false;
+  let historyBackfillLastAt = 0;
+  let historyBackfillLastResult = null;
+  let historyBackfillLastError = "";
+  let appServerDispatcherPromise = null;
   const modelByConversationKey = new Map();
   const resizeObservedNodes = new WeakSet();
 
@@ -262,11 +288,19 @@
     return latest;
   }
 
+  function parseTimestampPrefix(value) {
+    const prefix = String(value || "").split("-")[0];
+    return /^\d+(?:\.\d+)?$/.test(prefix) ? parseTimestamp(prefix) : null;
+  }
+
   function getTurnTimestamp(turn) {
-    const encoded = parseTimestamp(String(turn?.turnId || "").split("-")[0]);
+    const uuidEncoded = parseUuidV7Timestamp(turn?.turnId) || parseUuidV7Timestamp(turn?.id);
+    if (uuidEncoded) return uuidEncoded;
+
+    const encoded = parseTimestampPrefix(turn?.turnId);
     if (encoded) return encoded;
 
-    const idEncoded = parseTimestamp(String(turn?.id || "").split("-")[0]);
+    const idEncoded = parseTimestampPrefix(turn?.id);
     if (idEncoded) return idEncoded;
 
     const direct = parseTimestamp(
@@ -322,6 +356,8 @@
     const reasoning = firstCount(
       usage.reasoningTokens,
       usage.reasoning_tokens,
+      usage.reasoningOutputTokens,
+      usage.reasoning_output_tokens,
       usage.outputTokensDetails?.reasoningTokens,
       usage.output_tokens_details?.reasoning_tokens
     );
@@ -358,18 +394,26 @@
       value.model_id,
       value.toModel,
       value.threadSettings?.model,
+      value.thread_settings?.model,
       value.settings?.model,
       value.collaborationMode?.settings?.model,
+      value.collaboration_mode?.settings?.model,
       value.params?.model,
       value.params?.threadSettings?.model,
+      value.params?.thread_settings?.model,
       value.params?.settings?.model,
       value.params?.collaborationMode?.settings?.model,
+      value.params?.collaboration_mode?.settings?.model,
       value.request?.params?.model,
       value.request?.params?.threadSettings?.model,
+      value.request?.params?.thread_settings?.model,
       value.request?.params?.collaborationMode?.settings?.model,
+      value.request?.params?.collaboration_mode?.settings?.model,
       value.body?.model,
       value.body?.threadSettings?.model,
+      value.body?.thread_settings?.model,
       value.body?.collaborationMode?.settings?.model,
+      value.body?.collaboration_mode?.settings?.model,
     ];
     return candidates.map(normalizeModelName).find(Boolean) || "";
   }
@@ -809,8 +853,55 @@
       if (!Number.isFinite(timestamp) || timestamp < cutoff.getTime()) {
         delete state.days[key];
         changed = true;
+        continue;
+      }
+
+      const day = state.days[key];
+      if (!day || typeof day !== "object") {
+        delete state.days[key];
+        changed = true;
+        continue;
+      }
+
+      if (!day.turns || typeof day.turns !== "object") {
+        day.turns = {};
+        changed = true;
       }
     }
+    return changed;
+  }
+
+  function cumulativeUsageTurnId(dateKey, stableId) {
+    return `cumulative:${dateKey}:${normalizeConversationKey(stableId) || "session"}`;
+  }
+
+  function removeLegacyCumulativeTurns(dateKey, stableId, conversationKey, keepTurnId) {
+    const day = state.days[dateKey];
+    if (!day?.turns || typeof day.turns !== "object") return false;
+
+    const variants = new Set([
+      ...conversationKeyVariants(stableId),
+      ...conversationKeyVariants(conversationKey),
+    ]);
+    if (!variants.size) return false;
+
+    let changed = false;
+    for (const [turnId, turn] of Object.entries(day.turns)) {
+      if (turnId === keepTurnId) continue;
+      const legacyCumulative =
+        turnId.startsWith(`capture:cumulative:${dateKey}:`) ||
+        turnId.startsWith(`history:cumulative:${dateKey}:`);
+      if (!legacyCumulative) continue;
+
+      const turnVariants = [
+        ...conversationKeyVariants(turn?.conversationKey),
+        ...conversationKeyVariants(turnId.split(":").at(-1)),
+      ];
+      if (!turnVariants.some((key) => variants.has(key))) continue;
+      delete day.turns[turnId];
+      changed = true;
+    }
+    if (changed) state.days[dateKey] = day;
     return changed;
   }
 
@@ -1187,7 +1278,7 @@
     }
     summary.toolCallTotal = summary.mcpCalls + summary.pluginCalls;
     summary.toolTurnCount = toolTurnKeys.size;
-    summary.toolCallRate = summary.turns > 0 ? summary.toolTurnCount / summary.turns : 0;
+    summary.toolCallRate = summary.turns > 0 ? Math.min(1, matchedTurnIds.size / summary.turns) : 0;
     summary.avgToolsPerToolTurn = summary.toolTurnCount > 0 ? summary.toolCallTotal / summary.toolTurnCount : 0;
     summary.toolsPer100kTokens = summary.total > 0 ? (summary.toolCallTotal / summary.total) * 100000 : 0;
     for (const turnId of matchedTurnIds) {
@@ -1806,6 +1897,26 @@
     const id = extractCandidateId(value) || inheritedId;
     const model = extractDirectModel(value) || inheritedModel;
     const candidates = [];
+    const tokenCountInfo = value.type === "token_count" && value.info && typeof value.info === "object"
+      ? value.info
+      : value.payload?.type === "token_count" && value.payload?.info && typeof value.payload.info === "object"
+        ? value.payload.info
+        : null;
+    const tokenCountUsage = normalizeCaptureUsage(tokenCountInfo?.total_token_usage || tokenCountInfo?.totalTokenUsage);
+    if (tokenCountUsage) {
+      const conversationKey = extractConversationKey(value) || currentConversationIdFromDom();
+      return [
+        {
+          usage: tokenCountUsage,
+          id: id || conversationKey || "active-token-count",
+          model,
+          cumulative: true,
+          conversationKey,
+          timestamp: parseTimestamp(value.timestamp || value.payload?.timestamp),
+        },
+      ];
+    }
+
     const directKeys = [
       "usage",
       "token_usage",
@@ -2118,15 +2229,26 @@
     if (recentCaptureKeys.has(dedupeKey)) return false;
     recentCaptureKeys.set(dedupeKey, now);
 
-    const turnId = candidate.id
-      ? `capture:${candidate.id}`
+    const conversationKey = normalizeConversationKey(candidate.conversationKey || currentConversationIdFromDom());
+    const isCumulative = candidate.cumulative === true;
+    const observedAt = parseTimestamp(candidate.timestamp) || now;
+    const stableId = normalizeConversationKey(candidate.id) || conversationKey || "active-token-count";
+    const cumulativeId = cumulativeUsageTurnId(getDateKey(observedAt), stableId);
+    const turnId = isCumulative
+      ? cumulativeId
+      : candidate.id
+        ? `capture:${candidate.id}`
       : `${now}-${++captureSeq}`;
+    if (isCumulative) {
+      removeLegacyCumulativeTurns(getDateKey(observedAt), stableId, conversationKey, turnId);
+    }
     const changed = upsertTurn({
       turnId,
       model: candidate.model,
-      source: `capture:${source}`,
+      source: `capture:${source}${isCumulative ? ":cumulative" : ""}`,
       callCount: 1,
-      createdAt: new Date(now).toISOString(),
+      createdAt: new Date(observedAt).toISOString(),
+      conversationKey,
       usage: {
         inputTokens: candidate.usage.input,
         outputTokens: candidate.usage.output,
@@ -2210,12 +2332,14 @@
 
   function currentConversationIdFromDom(rootNode = document) {
     const selectors = [
-      "[data-above-composer-conversation-id]",
-      "[data-thread-conversation-id]",
-      "[data-conversation-id]",
+      { selector: "[data-above-composer-conversation-id]", attribute: "data-above-composer-conversation-id" },
+      { selector: "[data-thread-conversation-id]", attribute: "data-thread-conversation-id" },
+      { selector: "[data-conversation-id]", attribute: "data-conversation-id" },
+      { selector: "[data-app-action-sidebar-thread-id][aria-current='page']", attribute: "data-app-action-sidebar-thread-id" },
+      { selector: "[data-app-action-sidebar-thread-id][aria-current='true']", attribute: "data-app-action-sidebar-thread-id" },
     ];
-    for (const selector of selectors) {
-      const value = elementAttribute(safeQuery(rootNode, selector), selector.slice(1, -1));
+    for (const item of selectors) {
+      const value = elementAttribute(safeQuery(rootNode, item.selector), item.attribute);
       const key = normalizeConversationKey(value);
       if (key) return key;
     }
@@ -2483,6 +2607,499 @@
       window.WebSocket = window.WebSocket.__codexDailyTokenUsageOriginal;
     }
     captureInstalled = false;
+  }
+
+  function historyBackfillStatus() {
+    return {
+      inFlight: historyBackfillInFlight,
+      lastAt: historyBackfillLastAt,
+      lastResult: historyBackfillLastResult ? { ...historyBackfillLastResult } : null,
+      lastError: historyBackfillLastError,
+    };
+  }
+
+  function historyBackfillSuffix() {
+    if (historyBackfillInFlight) return " · 历史回填中";
+    if (historyBackfillLastResult?.sessions) {
+      return ` · 已回填 ${historyBackfillLastResult.sessions} 个 session`;
+    }
+    return "";
+  }
+
+  function dateKeyFromSessionPath(path) {
+    const match = /(?:^|\/|\\)\.codex(?:\/|\\)sessions(?:\/|\\)(\d{4})(?:\/|\\)(\d{2})(?:\/|\\)(\d{2})(?:\/|\\)[^/\\]+\.jsonl$/i.exec(
+      String(path || "")
+    );
+    if (!match) return "";
+    return `${match[1]}-${match[2]}-${match[3]}`;
+  }
+
+  function threadIdFromSessionPath(path) {
+    const match = /([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?:\.jsonl)?$/i.exec(
+      String(path || "")
+    );
+    return match ? match[1] : "";
+  }
+
+  function tokenCountInfoFromRow(row) {
+    if (!row || typeof row !== "object") return null;
+    if (row.type === "token_count" && row.info && typeof row.info === "object") return row.info;
+    if (row.payload?.type === "token_count" && row.payload?.info && typeof row.payload.info === "object") {
+      return row.payload.info;
+    }
+    return null;
+  }
+
+  function extractModelFromSessionRow(row) {
+    if (!row || typeof row !== "object") return "";
+    const payload = row.payload && typeof row.payload === "object" ? row.payload : {};
+    return (
+      extractDirectModel(payload.thread_settings) ||
+      extractDirectModel(payload.threadSettings) ||
+      extractDirectModel(payload.collaboration_mode) ||
+      extractDirectModel(payload.collaborationMode) ||
+      extractDirectModel(payload) ||
+      extractDirectModel(row)
+    );
+  }
+
+  function parseSessionUsageFromJsonl(text, fallback = {}) {
+    if (typeof text !== "string" || !text.trim()) return null;
+    const path = String(fallback.path || "");
+    const fallbackDateKey = normalizeConversationKey(fallback.dateKey) || dateKeyFromSessionPath(path);
+    const pathThreadId = threadIdFromSessionPath(path);
+    let threadId = pathThreadId || normalizeConversationKey(fallback.threadId);
+    let model = normalizeModelName(fallback.model);
+    let timestamp = parseTimestamp(fallback.timestamp) || parseTimestamp(`${fallbackDateKey}T12:00:00`);
+    let best = null;
+    let tokenCountEvents = 0;
+
+    for (const line of text.split(/\r?\n/)) {
+      if (!line || !line.includes("token_count") && !line.includes("session_meta") && !line.includes("thread_settings") && !line.includes("turn_context")) {
+        continue;
+      }
+      const row = safeParseJson(line);
+      if (!row) continue;
+
+      if (row.type === "session_meta") {
+        const payload = row.payload && typeof row.payload === "object" ? row.payload : {};
+        if (!threadId) {
+          threadId = normalizeConversationKey(payload.id) || normalizeConversationKey(payload.session_id) || threadId;
+        }
+        timestamp = parseTimestamp(payload.timestamp) || parseTimestamp(row.timestamp) || timestamp;
+      }
+
+      const rowModel = extractModelFromSessionRow(row);
+      if (rowModel) model = rowModel;
+
+      const info = tokenCountInfoFromRow(row);
+      const usage = normalizeCaptureUsage(info?.total_token_usage || info?.totalTokenUsage);
+      if (!usage) continue;
+
+      tokenCountEvents += 1;
+      const rowTimestamp = parseTimestamp(row.timestamp || row.payload?.timestamp || info.timestamp) || timestamp;
+      const candidate = { usage, timestamp: rowTimestamp };
+      if (!best || candidate.usage.total >= best.usage.total || candidate.timestamp > best.timestamp) {
+        best = candidate;
+      }
+    }
+
+    if (!best) return null;
+    const dateKey = fallbackDateKey || getDateKey(best.timestamp || timestamp || Date.now());
+    if (!parseDateKey(dateKey)) return null;
+    return {
+      dateKey,
+      threadId: threadId || shortHash(path || text.slice(0, 500)),
+      model: model || UNKNOWN_MODEL,
+      timestamp: best.timestamp || timestamp || parseTimestamp(`${dateKey}T12:00:00`) || Date.now(),
+      usage: best.usage,
+      tokenCountEvents,
+      path,
+    };
+  }
+
+  function upsertHistorySessionUsage(sessionUsage) {
+    if (!sessionUsage?.usage || !parseDateKey(sessionUsage.dateKey)) return false;
+    const todayKey = getDateKey(Date.now());
+    const minimumKey = getMinimumDateKey();
+    if (sessionUsage.dateKey < minimumKey || sessionUsage.dateKey > todayKey) return false;
+
+    const stableId = normalizeConversationKey(sessionUsage.threadId) || shortHash(sessionUsage.path || sessionUsage.dateKey);
+    const turnId = cumulativeUsageTurnId(sessionUsage.dateKey, stableId);
+    const conversationKey = stableId;
+    const timestamp =
+      parseTimestamp(sessionUsage.timestamp) ||
+      parseTimestamp(`${sessionUsage.dateKey}T12:00:00`) ||
+      Date.now();
+    removeLegacyCumulativeTurns(sessionUsage.dateKey, stableId, conversationKey, turnId);
+    return upsertTurn({
+      turnId,
+      model: sessionUsage.model,
+      source: "history:session-jsonl:cumulative",
+      callCount: Math.max(1, toCount(sessionUsage.tokenCountEvents)),
+      createdAt: new Date(timestamp).toISOString(),
+      conversationKey,
+      usage: {
+        inputTokens: sessionUsage.usage.input,
+        outputTokens: sessionUsage.usage.output,
+        cachedReadTokens: sessionUsage.usage.cached,
+        reasoningTokens: sessionUsage.usage.reasoning,
+        totalTokens: sessionUsage.usage.total,
+        hasBreakdown: true,
+      },
+    });
+  }
+
+  function pruneSupersededCaptureTurns(dateKeys) {
+    const keys = Array.from(new Set(Array.isArray(dateKeys) ? dateKeys : []));
+    let removed = 0;
+    for (const dateKey of keys) {
+      const day = state.days[dateKey];
+      if (!day?.turns || typeof day.turns !== "object") continue;
+      const hasHistory = Object.values(day.turns).some((turn) =>
+        String(turn?.source || "").startsWith("history:session-jsonl")
+      );
+      if (!hasHistory) continue;
+      for (const [turnId, turn] of Object.entries(day.turns)) {
+        if (!String(turn?.source || "").startsWith("capture:")) continue;
+        delete day.turns[turnId];
+        removed += 1;
+      }
+      state.days[dateKey] = day;
+    }
+    return removed;
+  }
+
+  function base64DecodeUtf8(dataBase64) {
+    if (typeof dataBase64 !== "string" || !dataBase64) return "";
+    try {
+      if (typeof atob === "function" && typeof TextDecoder === "function" && typeof Uint8Array === "function") {
+        const binary = atob(dataBase64);
+        const bytes = new Uint8Array(binary.length);
+        for (let index = 0; index < binary.length; index += 1) {
+          bytes[index] = binary.charCodeAt(index);
+        }
+        return new TextDecoder("utf-8").decode(bytes);
+      }
+      if (typeof Buffer !== "undefined") {
+        return Buffer.from(dataBase64, "base64").toString("utf8");
+      }
+      if (typeof atob === "function") return atob(dataBase64);
+    } catch {
+      return "";
+    }
+    return "";
+  }
+
+  function nativeFetch() {
+    return window.fetch?.__codexDailyTokenUsageOriginal || window.fetch;
+  }
+
+  function absoluteAppUrl(value, base = document.baseURI || location.href) {
+    if (!value) return "";
+    try {
+      return new URL(String(value), base).href;
+    } catch {
+      return "";
+    }
+  }
+
+  async function fetchAssetText(url) {
+    const fetchImpl = nativeFetch();
+    if (typeof fetchImpl !== "function" || !url) return "";
+    try {
+      const response = await fetchImpl.call(window, url);
+      if (!response?.ok) return "";
+      const text = await response.text();
+      return text.length > HISTORY_ASSET_SCAN_MAX_CHARS ? text.slice(0, HISTORY_ASSET_SCAN_MAX_CHARS) : text;
+    } catch {
+      return "";
+    }
+  }
+
+  function collectLoadedAssetUrls() {
+    const urls = new Set();
+    const push = (value) => {
+      const url = absoluteAppUrl(value);
+      if (url && /\/assets\/.+\.js(?:$|\?)/.test(url)) urls.add(url);
+    };
+    safeQueryAll(document, "script[src],link[href]").forEach((node) => {
+      push(elementAttribute(node, "src") || elementAttribute(node, "href"));
+    });
+    try {
+      performance.getEntriesByType?.("resource")?.forEach((entry) => push(entry.name));
+    } catch {
+      // performance entries may be unavailable in older builds.
+    }
+    return Array.from(urls);
+  }
+
+  function discoverAppServerAssetUrls(sourceUrl, sourceText) {
+    const urls = [];
+    const text = String(sourceText || "");
+    const patterns = [
+      /from\s*["'](\.\/app-server-manager-signals-[^"']+\.js)["']/g,
+      /import\(\s*["'](\.\/app-server-manager-signals-[^"']+\.js)["']\s*\)/g,
+      /["'](\.\/app-server-manager-signals-[^"']+\.js)["']/g,
+    ];
+    for (const pattern of patterns) {
+      let match = pattern.exec(text);
+      while (match) {
+        const url = absoluteAppUrl(match[1], sourceUrl);
+        if (url) urls.push(url);
+        match = pattern.exec(text);
+      }
+    }
+    return urls;
+  }
+
+  function assetMayContainAppServerDispatcher(sourceText) {
+    const text = String(sourceText || "");
+    return (
+      text.includes("send-cli-request-for-host") ||
+      text.includes("Missing AppServer request message handler") ||
+      /\.sendRequest\(\s*\w+\s*,\s*\w+\s*\)/.test(text)
+    );
+  }
+
+  function findDispatcherExport(moduleExports) {
+    if (!moduleExports || typeof moduleExports !== "object") return null;
+    for (const value of Object.values(moduleExports)) {
+      if (typeof value !== "function") continue;
+      const source = Function.prototype.toString.call(value);
+      if (/\.sendRequest\(\s*\w+\s*,\s*\w+\s*\)/.test(source) || /Missing AppServer request message handler/.test(source)) {
+        return value;
+      }
+    }
+    return null;
+  }
+
+  async function resolveAppServerDispatcher() {
+    if (appServerDispatcherPromise) return appServerDispatcherPromise;
+    appServerDispatcherPromise = (async () => {
+      const loadedUrls = collectLoadedAssetUrls();
+      const candidateUrls = new Set(loadedUrls.filter((url) => /\/assets\/app-server-manager-signals-/.test(url)));
+      const scanUrls = loadedUrls
+        .filter((url) => /\/assets\/.+\.js(?:$|\?)/.test(url))
+        .sort((a, b) => {
+          const score = (url) =>
+            (/app-initial~/.test(url) ? 0 : 10) +
+            (/artifact-tab-content\.electron|avatarOverlayCompositionSurface|rpc|index|app-main/.test(url) ? 0 : 5) +
+            Math.min(4, url.length / 120);
+          return score(a) - score(b);
+        })
+        .slice(0, HISTORY_ASSET_SCAN_LIMIT);
+      for (const url of scanUrls) {
+        const text = await fetchAssetText(url);
+        if (assetMayContainAppServerDispatcher(text)) candidateUrls.add(url);
+        discoverAppServerAssetUrls(url, text).forEach((assetUrl) => candidateUrls.add(assetUrl));
+      }
+
+      for (const url of candidateUrls) {
+        try {
+          const moduleExports = await import(/* @vite-ignore */ url);
+          const dispatcher = findDispatcherExport(moduleExports);
+          if (dispatcher) return dispatcher;
+        } catch {
+          // Try the next candidate module.
+        }
+      }
+      return null;
+    })();
+    return appServerDispatcherPromise;
+  }
+
+  async function sendCliRequest(method, params = {}, timeoutMs = HISTORY_REQUEST_TIMEOUT_MS) {
+    const dispatcher = await resolveAppServerDispatcher();
+    if (typeof dispatcher !== "function") throw new Error("未找到 Codex app-server 通道");
+    return dispatcher("send-cli-request-for-host", {
+      hostId: "local",
+      method,
+      params,
+      timeoutMs,
+    });
+  }
+
+  function threadListItems(response) {
+    if (Array.isArray(response)) return response;
+    if (Array.isArray(response?.data)) return response.data;
+    if (Array.isArray(response?.threads)) return response.threads;
+    if (Array.isArray(response?.items)) return response.items;
+    return [];
+  }
+
+  function threadListCursor(response) {
+    return response?.nextCursor || response?.next_cursor || response?.cursor || null;
+  }
+
+  function threadPath(thread) {
+    return normalizeConversationKey(thread?.path || thread?.sessionPath || thread?.session_path || thread?.rolloutPath || thread?.rollout_path);
+  }
+
+  function threadIdentity(thread) {
+    return normalizeConversationKey(thread?.id || thread?.threadId || thread?.thread_id || thread?.conversationId || thread?.conversation_id);
+  }
+
+  function threadUpdatedAt(thread) {
+    return parseTimestamp(thread?.updatedAt ?? thread?.updated_at ?? thread?.lastUpdatedAt ?? thread?.last_updated_at ?? thread?.createdAt ?? thread?.created_at);
+  }
+
+  function isRecentSessionThread(thread, now = Date.now()) {
+    const path = threadPath(thread);
+    const dateKey = dateKeyFromSessionPath(path);
+    if (!dateKey) return false;
+    return dateKey >= getMinimumDateKey(now) && dateKey <= getDateKey(now);
+  }
+
+  async function listRecentSessionThreads() {
+    const threads = new Map();
+    let lastError = "";
+    for (const archived of [false, true]) {
+      let cursor = null;
+      for (let page = 0; page < 4 && threads.size < HISTORY_THREAD_SCAN_LIMIT; page += 1) {
+        let response = null;
+        try {
+          response = await sendCliRequest("thread/list", {
+            archived,
+            cursor,
+            limit: HISTORY_THREAD_PAGE_LIMIT,
+            sortKey: "updated_at",
+            modelProviders: [],
+            sourceKinds: HISTORY_THREAD_SOURCE_KINDS,
+            useStateDbOnly: true,
+            includeAllWorkspaces: true,
+            includeAllProjects: true,
+          });
+        } catch (error) {
+          lastError = error?.message ? String(error.message) : "thread/list failed";
+          break;
+        }
+        const items = threadListItems(response);
+        for (const thread of items) {
+          if (!isRecentSessionThread(thread)) continue;
+          const path = threadPath(thread);
+          if (!path || threads.has(path)) continue;
+          threads.set(path, thread);
+          if (threads.size >= HISTORY_THREAD_SCAN_LIMIT) break;
+        }
+        cursor = threadListCursor(response);
+        if (!cursor || !items.length) break;
+      }
+    }
+    if (!threads.size && lastError) throw new Error(lastError);
+    return Array.from(threads.values()).sort((a, b) => (threadUpdatedAt(b) || 0) - (threadUpdatedAt(a) || 0));
+  }
+
+  async function readSessionText(path) {
+    const response = await sendCliRequest("fs/readFile", { path }, HISTORY_REQUEST_TIMEOUT_MS);
+    const dataBase64 =
+      response?.dataBase64 ||
+      response?.data_base64 ||
+      response?.contentBase64 ||
+      response?.content_base64 ||
+      response?.data?.dataBase64 ||
+      response?.data?.data_base64;
+    return base64DecodeUtf8(dataBase64);
+  }
+
+  async function mapLimit(items, limit, mapper) {
+    const results = new Array(items.length);
+    let index = 0;
+    const workerCount = Math.max(1, Math.min(limit, items.length));
+    await Promise.all(
+      Array.from({ length: workerCount }, async () => {
+        while (index < items.length) {
+          const current = index;
+          index += 1;
+          results[current] = await mapper(items[current], current);
+        }
+      })
+    );
+    return results;
+  }
+
+  async function readThreadSessionUsage(thread) {
+    const path = threadPath(thread);
+    if (!path) return null;
+    const text = await readSessionText(path);
+    return parseSessionUsageFromJsonl(text, {
+      path,
+      dateKey: dateKeyFromSessionPath(path),
+      threadId: threadIdentity(thread),
+      model: extractDirectModel(thread),
+      timestamp: threadUpdatedAt(thread),
+    });
+  }
+
+  async function runHistoryBackfill({ force = false } = {}) {
+    const now = Date.now();
+    if (destroyed || historyBackfillInFlight) return historyBackfillLastResult;
+    if (!force && historyBackfillLastAt && now - historyBackfillLastAt < HISTORY_BACKFILL_INTERVAL_MS) {
+      return historyBackfillLastResult;
+    }
+
+    historyBackfillInFlight = true;
+    historyBackfillLastError = "";
+    render({ animate: false });
+    try {
+      const threads = await listRecentSessionThreads();
+      const usages = await mapLimit(threads, HISTORY_READ_CONCURRENCY, async (thread) => {
+        try {
+          return await readThreadSessionUsage(thread);
+        } catch {
+          return null;
+        }
+      });
+
+      let changed = false;
+      let sessions = 0;
+      let tokenCountEvents = 0;
+      const historyDateKeys = new Set();
+      for (const usage of usages) {
+        if (!usage) continue;
+        sessions += 1;
+        tokenCountEvents += toCount(usage.tokenCountEvents);
+        historyDateKeys.add(usage.dateKey);
+        changed = upsertHistorySessionUsage(usage) || changed;
+      }
+      const captureTurnsPruned = pruneSupersededCaptureTurns(Array.from(historyDateKeys));
+      changed = captureTurnsPruned > 0 || changed;
+
+      historyBackfillLastAt = Date.now();
+      historyBackfillLastResult = {
+        threads: threads.length,
+        sessions,
+        tokenCountEvents,
+        captureTurnsPruned,
+        changed,
+      };
+      if (changed) {
+        pruneState();
+        saveState();
+      }
+      render({ animate: changed });
+      return historyBackfillLastResult;
+    } catch (error) {
+      historyBackfillLastAt = Date.now();
+      historyBackfillLastError = error?.message ? String(error.message) : "历史回填失败";
+      return historyBackfillLastResult;
+    } finally {
+      historyBackfillInFlight = false;
+      render({ animate: false });
+    }
+  }
+
+  function scheduleHistoryBackfill(delayMs = HISTORY_BACKFILL_INITIAL_DELAY_MS) {
+    if (destroyed) return;
+    if (historyBackfillTimer) window.clearTimeout(historyBackfillTimer);
+    historyBackfillTimer = window.setTimeout(() => {
+      historyBackfillTimer = null;
+      runHistoryBackfill()
+        .catch(() => {})
+        .finally(() => {
+          if (!destroyed) scheduleHistoryBackfill(HISTORY_BACKFILL_INTERVAL_MS);
+        });
+    }, Math.max(1000, delayMs));
   }
 
   function readExternalTurns() {
@@ -4041,13 +4658,14 @@
   }
 
   function sourceStatusText(snapshot) {
+    const suffix = historyBackfillSuffix();
     if (sourceMode === "external") {
-      return `${snapshot.turns} 个 turn · 复用 Codex Token Usage`;
+      return `${snapshot.turns} 个 turn · 复用 Codex Token Usage${suffix}`;
     }
     if (sourceMode === "standalone") {
-      return `${snapshot.turns} 个 turn · 本机累计 · 独立采集`;
+      return `${snapshot.turns} 个 turn · 本机累计 · 独立采集${suffix}`;
     }
-    return externalSourceAvailable() ? "等待 Codex Token Usage 数据" : "等待数据源，必要时自动采集";
+    return externalSourceAvailable() ? `等待 Codex Token Usage 数据${suffix}` : `等待数据源，必要时自动采集${suffix}`;
   }
 
   function trendTooltipHtml(point) {
@@ -4248,6 +4866,7 @@
     destroyed = true;
     if (pollTimer) window.clearInterval(pollTimer);
     if (midnightTimer) window.clearTimeout(midnightTimer);
+    if (historyBackfillTimer) window.clearTimeout(historyBackfillTimer);
     if (closeTimer) window.clearTimeout(closeTimer);
     if (shareFeedbackTimer) window.clearTimeout(shareFeedbackTimer);
     if (layoutRaf) {
@@ -4286,6 +4905,8 @@
     getDefaultModelPrices: () => JSON.parse(JSON.stringify(DEFAULT_OPENAI_MODEL_PRICES)),
     setModelPrice,
     clearModelPrice,
+    runHistoryBackfill: () => runHistoryBackfill({ force: true }),
+    getHistoryBackfillStatus: historyBackfillStatus,
     resetToday,
     destroy,
     __test: {
@@ -4309,6 +4930,13 @@
       shiftDateKey,
       clampDateKey,
       getMinimumDateKey,
+      dateKeyFromSessionPath,
+      threadIdFromSessionPath,
+      parseSessionUsageFromJsonl,
+      upsertHistorySessionUsage,
+      cumulativeUsageTurnId,
+      removeLegacyCumulativeTurns,
+      pruneSupersededCaptureTurns,
       pruneState,
       getTurnTimestamp,
       isUsageTurn,
@@ -4326,6 +4954,7 @@
       processCapturePayload,
       processModelPayload,
       syncFromSource,
+      historyBackfillStatus,
       installStandaloneCapture,
       externalSourceAvailable,
       getSourceMode: () => sourceMode,
@@ -4362,6 +4991,7 @@
     document.addEventListener("pointerdown", handleDocumentPointerDown, true);
     window.addEventListener("resize", handleWindowResize);
     pollTimer = window.setInterval(refresh, POLL_INTERVAL_MS);
+    scheduleHistoryBackfill();
     scheduleMidnightRefresh();
   }
 
