@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated_at": "2026-07-28T03:17:39Z",
+  "updated_at": "2026-08-20T06:33:24Z",
   "scripts": [
     {
       "id": "codex-context-used-meter",
@@ -72,8 +72,8 @@
     {
       "id": "codex-daily-token-usage",
       "name": "Codex Daily Token Usage",
-      "description": "每日 Token 统计，近 5 日滚动存储，自动复用已有采集，必要时回填本机历史 session，支持 Model 价格、成本估算、趋势明细和分享图",
-      "version": "1.4.16",
+      "description": "每日 Token 统计，近 5 日滚动存储，支持新版 RPC 历史回填与长任务跨日增量，提供 Model 价格、成本估算、趋势明细和分享图",
+      "version": "1.4.17",
       "author": "kts-kris",
       "tags": [
         "codex",
@@ -85,7 +85,7 @@
       ],
       "homepage": "",
       "script_url": "https://raw.githubusercontent.com/BigPizzaV3/CodexPlusPlusScriptMarket/main/scripts/codex-daily-token-usage.js",
-      "sha256": "c7af60e616355d8d4746024cad80886b98c1917dd642d25f4e3c9cfa7d402bdc"
+      "sha256": "6dac6e559d11ddeb36358af1851cac54390a00a9d7af2b0819719ba92b282ab7"
     },
     {
       "id": "codex-list-pagebuster",

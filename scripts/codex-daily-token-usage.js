@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Codex Daily Token Usage
 // @namespace    codex-plus-plus
-// @version      1.4.16
+// @version      1.4.17
 // @description  每日 Token 统计，近 5 日滚动存储，优先复用已有采集，必要时回填本机历史 session，支持 Model 价格、成本估算、日期切换、5 日趋势与分享图。
 // @match        app://-/*
 // @run-at       document-start
@@ -10,7 +10,7 @@
 (() => {
   "use strict";
 
-  const VERSION = "1.4.16";
+  const VERSION = "1.4.17";
   const API_KEY = "__codexDailyTokenUsage";
   const SOURCE_API_KEY = "__codexTokenUsage";
   const STORAGE_KEY = "__codexDailyTokenUsageV1";
@@ -39,10 +39,11 @@
   const HISTORY_BACKFILL_INTERVAL_MS = 10 * 60 * 1000;
   const HISTORY_THREAD_SCAN_LIMIT = 200;
   const HISTORY_THREAD_PAGE_LIMIT = 100;
-  const HISTORY_READ_CONCURRENCY = 3;
+  const HISTORY_READ_CONCURRENCY = 2;
   const HISTORY_ASSET_SCAN_LIMIT = 8;
   const HISTORY_ASSET_SCAN_MAX_CHARS = 1_200_000;
   const HISTORY_REQUEST_TIMEOUT_MS = 20000;
+  const HISTORY_MAX_SESSION_BYTES = 128 * 1024 * 1024;
   const HISTORY_THREAD_SOURCE_KINDS = Object.freeze([
     "cli",
     "vscode",
@@ -182,6 +183,8 @@
   let historyBackfillLastResult = null;
   let historyBackfillLastError = "";
   let appServerDispatcherPromise = null;
+  let appServicesPromise = null;
+  let domToolScanTimer = null;
   const modelByConversationKey = new Map();
   const resizeObservedNodes = new WeakSet();
 
@@ -293,15 +296,6 @@
   }
 
   function getTurnTimestamp(turn) {
-    const uuidEncoded = parseUuidV7Timestamp(turn?.turnId) || parseUuidV7Timestamp(turn?.id);
-    if (uuidEncoded) return uuidEncoded;
-
-    const encoded = parseTimestampPrefix(turn?.turnId);
-    if (encoded) return encoded;
-
-    const idEncoded = parseTimestampPrefix(turn?.id);
-    if (idEncoded) return idEncoded;
-
     const direct = parseTimestamp(
       turn?.createdAt ??
         turn?.created_at ??
@@ -315,6 +309,17 @@
         turn?.last_updated_at ??
         turn?.timestamp
     );
+    if (isHistoryUsageTurn(turn) && direct) return direct;
+
+    const uuidEncoded = parseUuidV7Timestamp(turn?.turnId) || parseUuidV7Timestamp(turn?.id);
+    if (uuidEncoded) return uuidEncoded;
+
+    const encoded = parseTimestampPrefix(turn?.turnId);
+    if (encoded) return encoded;
+
+    const idEncoded = parseTimestampPrefix(turn?.id);
+    if (idEncoded) return idEncoded;
+
     if (direct) return direct;
 
     return latestNestedTimestamp(turn?.calls) || latestNestedTimestamp(turn?.ledgerEvents);
@@ -904,7 +909,10 @@
       if (turnId === keepTurnId) continue;
       const legacyCumulative =
         turnId.startsWith(`capture:cumulative:${dateKey}:`) ||
-        turnId.startsWith(`history:cumulative:${dateKey}:`);
+        turnId.startsWith(`history:cumulative:${dateKey}:`) ||
+        (turnId === cumulativeUsageTurnId(dateKey, conversationKey) ||
+          turnId.startsWith(`${cumulativeUsageTurnId(dateKey, conversationKey)}:`)) &&
+          isHistoryUsageTurn(turn);
       if (!legacyCumulative) continue;
 
       const turnVariants = [
@@ -916,6 +924,40 @@
       changed = true;
     }
     if (changed) state.days[dateKey] = day;
+    return changed;
+  }
+
+  function isHistoryUsageTurn(turn) {
+    return String(turn?.source || "").startsWith("history:session-jsonl");
+  }
+
+  function latestHistoryUsageTimestamp(day) {
+    let latest = 0;
+    for (const turn of Object.values(day?.turns || {})) {
+      if (!isHistoryUsageTurn(turn)) continue;
+      latest = Math.max(latest, toCount(turn.updatedAt));
+    }
+    return latest;
+  }
+
+  function historyCoverageTimestamp(day) {
+    return day?.historyCoverageComplete === true ? toCount(day.historyCoveredUntil) : 0;
+  }
+
+  function markHistoryCoverageComplete(dateKeys) {
+    let changed = false;
+    for (const dateKey of new Set(Array.isArray(dateKeys) ? dateKeys : [])) {
+      const day = state.days[dateKey];
+      if (!day) continue;
+      const coveredUntil = latestHistoryUsageTimestamp(day);
+      if (!coveredUntil) continue;
+      if (day.historyCoverageComplete === true && toCount(day.historyCoveredUntil) === coveredUntil) continue;
+      day.historyCoverageComplete = true;
+      day.historyCoveredUntil = coveredUntil;
+      state.days[dateKey] = day;
+      invalidateDay(dateKey);
+      changed = true;
+    }
     return changed;
   }
 
@@ -943,6 +985,11 @@
       modelConfidence: modelMeta.confidence,
       conversationKey,
     };
+
+    const historyCoveredUntil = historyCoverageTimestamp(day);
+    if (!isHistoryUsageTurn(candidate) && historyCoveredUntil && timestamp <= historyCoveredUntil) {
+      return false;
+    }
 
     if (existing && existing.total > candidate.total) {
       if (
@@ -2785,19 +2832,56 @@
     );
   }
 
-  function parseSessionUsageFromJsonl(text, fallback = {}) {
-    if (typeof text !== "string" || !text.trim()) return null;
+  function extractModelFromSessionLine(line) {
+    const match = /"model"\s*:\s*"((?:\\.|[^"\\])*)"/.exec(String(line || ""));
+    if (!match) return "";
+    try {
+      return normalizeModelName(JSON.parse(`"${match[1]}"`));
+    } catch {
+      return "";
+    }
+  }
+
+  function cumulativeUsageDelta(current, previous, last) {
+    if (!current) return null;
+    const fallback = last || current;
+    if (!previous || current.total < previous.total) return fallback;
+    const usage = {
+      input: Math.max(0, current.input - previous.input),
+      output: Math.max(0, current.output - previous.output),
+      cached: Math.max(0, current.cached - previous.cached),
+      reasoning: Math.max(0, current.reasoning - previous.reasoning),
+      total: Math.max(0, current.total - previous.total),
+    };
+    return usage.total > 0 ? usage : null;
+  }
+
+  function parseSessionUsagesFromJsonl(text, fallback = {}) {
+    if (typeof text !== "string" || !text.trim()) return [];
     const path = String(fallback.path || "");
-    const fallbackDateKey = normalizeConversationKey(fallback.dateKey) || dateKeyFromSessionPath(path);
     const pathThreadId = threadIdFromSessionPath(path);
     let threadId = pathThreadId || normalizeConversationKey(fallback.threadId);
     let model = normalizeModelName(fallback.model);
-    let timestamp = parseTimestamp(fallback.timestamp) || parseTimestamp(`${fallbackDateKey}T12:00:00`);
-    let best = null;
-    let tokenCountEvents = 0;
+    let timestamp = parseTimestamp(fallback.timestamp) || parseTimestamp(`${dateKeyFromSessionPath(path)}T12:00:00`);
+    let previousCumulative = null;
+    const minimumDateKey = normalizeConversationKey(fallback.minimumDateKey) || getMinimumDateKey();
+    const maximumDateKey = normalizeConversationKey(fallback.maximumDateKey) || getDateKey(Date.now());
+    const groups = new Map();
 
-    for (const line of text.split(/\r?\n/)) {
-      if (!line || !line.includes("token_count") && !line.includes("session_meta") && !line.includes("thread_settings") && !line.includes("turn_context")) {
+    let offset = 0;
+    while (offset < text.length) {
+      const lineEnd = text.indexOf("\n", offset);
+      const end = lineEnd < 0 ? text.length : lineEnd;
+      const line = text.slice(offset, end);
+      offset = lineEnd < 0 ? text.length : lineEnd + 1;
+      if (!line) continue;
+      const hasTokenCount = line.includes("token_count");
+      const hasSessionMeta = line.includes("session_meta");
+      if (!hasTokenCount && !hasSessionMeta) {
+        if (line.includes("thread_settings") || line.includes("turn_context")) {
+          const lineModel = extractModelFromSessionLine(line);
+          if (lineModel) model = lineModel;
+        }
         continue;
       }
       const row = safeParseJson(line);
@@ -2815,29 +2899,50 @@
       if (rowModel) model = rowModel;
 
       const info = tokenCountInfoFromRow(row);
-      const usage = normalizeCaptureUsage(info?.total_token_usage || info?.totalTokenUsage);
+      const cumulative = normalizeCaptureUsage(info?.total_token_usage || info?.totalTokenUsage);
+      if (!cumulative) continue;
+      const last = normalizeCaptureUsage(info?.last_token_usage || info?.lastTokenUsage);
+      const usage = cumulativeUsageDelta(cumulative, previousCumulative, last);
+      previousCumulative = cumulative;
       if (!usage) continue;
 
-      tokenCountEvents += 1;
       const rowTimestamp = parseTimestamp(row.timestamp || row.payload?.timestamp || info.timestamp) || timestamp;
-      const candidate = { usage, timestamp: rowTimestamp };
-      if (!best || candidate.usage.total >= best.usage.total || candidate.timestamp > best.timestamp) {
-        best = candidate;
-      }
+      const dateKey = getDateKey(rowTimestamp || Date.now());
+      if (dateKey < minimumDateKey || dateKey > maximumDateKey) continue;
+      const groupModel = model || UNKNOWN_MODEL;
+      const groupKey = `${dateKey}\u0000${groupModel}`;
+      const group = groups.get(groupKey) || {
+        dateKey,
+        threadId: threadId || shortHash(path || text.slice(0, 500)),
+        stableId: "",
+        model: groupModel,
+        timestamp: 0,
+        usage: { input: 0, output: 0, cached: 0, reasoning: 0, total: 0 },
+        tokenCountEvents: 0,
+        path,
+      };
+      group.usage.input += usage.input;
+      group.usage.output += usage.output;
+      group.usage.cached += usage.cached;
+      group.usage.reasoning += usage.reasoning;
+      group.usage.total += usage.total;
+      group.timestamp = Math.max(group.timestamp, rowTimestamp || timestamp || 0);
+      group.tokenCountEvents += 1;
+      groups.set(groupKey, group);
     }
 
-    if (!best) return null;
-    const dateKey = fallbackDateKey || getDateKey(best.timestamp || timestamp || Date.now());
-    if (!parseDateKey(dateKey)) return null;
-    return {
-      dateKey,
-      threadId: threadId || shortHash(path || text.slice(0, 500)),
-      model: model || UNKNOWN_MODEL,
-      timestamp: best.timestamp || timestamp || parseTimestamp(`${dateKey}T12:00:00`) || Date.now(),
-      usage: best.usage,
-      tokenCountEvents,
-      path,
-    };
+    return Array.from(groups.values())
+      .map((usage) => ({
+        ...usage,
+        stableId: `session-${shortHash(`${usage.threadId}|${usage.model}`)}`,
+        timestamp: usage.timestamp || parseTimestamp(`${usage.dateKey}T12:00:00`) || Date.now(),
+      }))
+      .sort((left, right) => left.timestamp - right.timestamp || left.model.localeCompare(right.model));
+  }
+
+  function parseSessionUsageFromJsonl(text, fallback = {}) {
+    const usages = parseSessionUsagesFromJsonl(text, fallback);
+    return usages.length === 1 ? usages[0] : usages.at(-1) || null;
   }
 
   function upsertHistorySessionUsage(sessionUsage) {
@@ -2846,9 +2951,12 @@
     const minimumKey = getMinimumDateKey();
     if (sessionUsage.dateKey < minimumKey || sessionUsage.dateKey > todayKey) return false;
 
-    const stableId = normalizeConversationKey(sessionUsage.threadId) || shortHash(sessionUsage.path || sessionUsage.dateKey);
+    const stableId =
+      normalizeConversationKey(sessionUsage.stableId) ||
+      normalizeConversationKey(sessionUsage.threadId) ||
+      shortHash(sessionUsage.path || sessionUsage.dateKey);
     const turnId = cumulativeUsageTurnId(sessionUsage.dateKey, stableId);
-    const conversationKey = stableId;
+    const conversationKey = normalizeConversationKey(sessionUsage.threadId) || stableId;
     const timestamp =
       parseTimestamp(sessionUsage.timestamp) ||
       parseTimestamp(`${sessionUsage.dateKey}T12:00:00`) ||
@@ -2872,24 +2980,26 @@
     });
   }
 
-  function pruneSupersededCaptureTurns(dateKeys) {
+  function pruneSupersededUsageTurns(dateKeys) {
     const keys = Array.from(new Set(Array.isArray(dateKeys) ? dateKeys : []));
     let removed = 0;
     for (const dateKey of keys) {
       const day = state.days[dateKey];
       if (!day?.turns || typeof day.turns !== "object") continue;
-      const hasHistory = Object.values(day.turns).some((turn) =>
-        String(turn?.source || "").startsWith("history:session-jsonl")
-      );
-      if (!hasHistory) continue;
+      const historyCoveredUntil = historyCoverageTimestamp(day);
+      if (!historyCoveredUntil) continue;
       for (const [turnId, turn] of Object.entries(day.turns)) {
-        if (!String(turn?.source || "").startsWith("capture:")) continue;
+        if (isHistoryUsageTurn(turn) || toCount(turn?.updatedAt) > historyCoveredUntil) continue;
         delete day.turns[turnId];
         removed += 1;
       }
       state.days[dateKey] = day;
     }
     return removed;
+  }
+
+  function pruneSupersededCaptureTurns(dateKeys) {
+    return pruneSupersededUsageTurns(dateKeys);
   }
 
   function base64DecodeUtf8(dataBase64) {
@@ -2956,6 +3066,143 @@
     return Array.from(urls);
   }
 
+  function bootstrapThreadIds(bootstrap) {
+    const ids = new Set();
+    for (const entry of bootstrap?.catalogEntries || []) {
+      const id = threadIdentity(entry);
+      if (id) ids.add(id);
+    }
+    const trackedKeys = new Set(["projectless-thread-ids", "thread-workspace-root-hints", "thread-project-assignments"]);
+    for (const entry of bootstrap?.globalStateEntries || []) {
+      if (!trackedKeys.has(entry?.key)) continue;
+      const value = entry?.value;
+      if (Array.isArray(value)) {
+        for (const id of value) {
+          const normalized = normalizeConversationKey(id);
+          if (normalized) ids.add(normalized);
+        }
+      } else if (value && typeof value === "object") {
+        for (const id of Object.keys(value)) {
+          const normalized = normalizeConversationKey(id);
+          if (normalized) ids.add(normalized);
+        }
+      }
+    }
+    return Array.from(ids);
+  }
+
+  function homeDirectoryFromPath(value) {
+    const path = String(value || "").trim();
+    if (!path) return "";
+    const unix = /^(\/Users\/[^/]+|\/home\/[^/]+|\/root)(?:\/|$)/.exec(path);
+    if (unix) return unix[1];
+    const windows = /^([a-z]:[\\/]Users[\\/][^\\/]+)(?:[\\/]|$)/i.exec(path);
+    return windows ? windows[1] : "";
+  }
+
+  function bootstrapHomeDirectories(bootstrap) {
+    const homes = new Set();
+    const add = (value) => {
+      const home = homeDirectoryFromPath(value);
+      if (home) homes.add(home);
+    };
+    for (const entry of bootstrap?.catalogEntries || []) add(entry?.cwd);
+    for (const value of bootstrap?.workspaceRootOptions?.roots || []) add(value);
+    add(bootstrap?.projectlessWorkspaceRoot?.workspaceRoot);
+    for (const entry of bootstrap?.globalStateEntries || []) {
+      if (entry?.key !== "thread-workspace-root-hints" || !entry.value || typeof entry.value !== "object") continue;
+      for (const value of Object.values(entry.value)) add(value);
+    }
+    return Array.from(homes);
+  }
+
+  function sessionPathFromThreadId(threadId, homeDirectory) {
+    const timestamp = parseUuidV7Timestamp(threadId);
+    const home = String(homeDirectory || "").replace(/[\\/]+$/, "");
+    if (!timestamp || !home) return "";
+    const date = new Date(timestamp);
+    const pad = (value) => String(value).padStart(2, "0");
+    const year = String(date.getFullYear());
+    const month = pad(date.getMonth() + 1);
+    const day = pad(date.getDate());
+    const time = `${pad(date.getHours())}-${pad(date.getMinutes())}-${pad(date.getSeconds())}`;
+    const separator = home.includes("\\") && !home.includes("/") ? "\\" : "/";
+    return [home, ".codex", "sessions", year, month, day, `rollout-${year}-${month}-${day}T${time}-${threadId}.jsonl`].join(
+      separator
+    );
+  }
+
+  async function resolveAppServices() {
+    if (appServicesPromise) return appServicesPromise;
+    appServicesPromise = (async () => {
+      const urls = collectLoadedAssetUrls().filter((url) => /\/assets\/rpc-[^/]+\.js(?:$|\?)/.test(url));
+      for (const url of urls) {
+        try {
+          const moduleExports = await import(/* @vite-ignore */ url);
+          if (moduleExports?.appServices?.workspaceFiles && moduleExports?.appServices?.localThreadCatalog) {
+            return moduleExports.appServices;
+          }
+        } catch {
+          // Try the next loaded RPC module.
+        }
+      }
+      return null;
+    })();
+    return appServicesPromise;
+  }
+
+  async function listRecentWorkspaceSessionThreads() {
+    const services = await resolveAppServices();
+    const bootstrap = await window.electronBridge?.getInitialSidebarBootstrap?.();
+    if (!services || !bootstrap) return [];
+    const ids = bootstrapThreadIds(bootstrap);
+    if (!ids.length) return [];
+
+    const entriesById = new Map();
+    for (const entry of bootstrap.catalogEntries || []) {
+      const id = threadIdentity(entry);
+      if (id) entriesById.set(id, entry);
+    }
+    for (let offset = 0; offset < ids.length; offset += 100) {
+      const refs = ids.slice(offset, offset + 100).map((threadId) => ({ hostId: "local", threadId }));
+      try {
+        const entries = await services.localThreadCatalog.readEntries(refs);
+        for (const entry of entries || []) {
+          const id = threadIdentity(entry);
+          if (id) entriesById.set(id, entry);
+        }
+      } catch {
+        // Initial sidebar entries remain available as a reduced fallback.
+      }
+    }
+
+    const minimumDate = parseDateKey(getMinimumDateKey());
+    minimumDate?.setHours(0, 0, 0, 0);
+    const minimumTimestamp = minimumDate?.getTime() || 0;
+    const homes = bootstrapHomeDirectories(bootstrap);
+    return Array.from(entriesById.values())
+      .filter((entry) => {
+        const id = threadIdentity(entry);
+        const updatedAt = threadUpdatedAt(entry);
+        return !!parseUuidV7Timestamp(id) && !!updatedAt && updatedAt >= minimumTimestamp;
+      })
+      .map((entry) => {
+        const id = threadIdentity(entry);
+        const sessionPaths = homes.map((home) => sessionPathFromThreadId(id, home)).filter(Boolean);
+        return {
+          ...entry,
+          id,
+          path: sessionPaths[0] || "",
+          sessionPaths,
+          updatedAt: threadUpdatedAt(entry),
+          historyTransport: "workspace-files",
+        };
+      })
+      .filter((entry) => entry.path)
+      .sort((left, right) => (threadUpdatedAt(right) || 0) - (threadUpdatedAt(left) || 0))
+      .slice(0, HISTORY_THREAD_SCAN_LIMIT);
+  }
+
   function discoverAppServerAssetUrls(sourceUrl, sourceText) {
     const urls = [];
     const text = String(sourceText || "");
@@ -3005,7 +3252,7 @@
         .filter((url) => /\/assets\/.+\.js(?:$|\?)/.test(url))
         .sort((a, b) => {
           const score = (url) =>
-            (/app-initial~/.test(url) ? 0 : 10) +
+            (/app-initial[-~]/.test(url) ? 0 : 10) +
             (/artifact-tab-content\.electron|avatarOverlayCompositionSurface|rpc|index|app-main/.test(url) ? 0 : 5) +
             Math.min(4, url.length / 120);
           return score(a) - score(b);
@@ -3058,22 +3305,50 @@
     return normalizeConversationKey(thread?.path || thread?.sessionPath || thread?.session_path || thread?.rolloutPath || thread?.rollout_path);
   }
 
+  function threadPaths(thread) {
+    return Array.from(
+      new Set([threadPath(thread), ...(Array.isArray(thread?.sessionPaths) ? thread.sessionPaths : [])].filter(Boolean))
+    );
+  }
+
   function threadIdentity(thread) {
     return normalizeConversationKey(thread?.id || thread?.threadId || thread?.thread_id || thread?.conversationId || thread?.conversation_id);
   }
 
   function threadUpdatedAt(thread) {
-    return parseTimestamp(thread?.updatedAt ?? thread?.updated_at ?? thread?.lastUpdatedAt ?? thread?.last_updated_at ?? thread?.createdAt ?? thread?.created_at);
+    return parseTimestamp(
+      thread?.updatedAt ??
+        thread?.updated_at ??
+        thread?.lastUpdatedAt ??
+        thread?.last_updated_at ??
+        thread?.sourceUpdatedAt ??
+        thread?.sourceRecencyAt ??
+        thread?.createdAt ??
+        thread?.created_at ??
+        thread?.sourceCreatedAt
+    );
   }
 
   function isRecentSessionThread(thread, now = Date.now()) {
     const path = threadPath(thread);
     const dateKey = dateKeyFromSessionPath(path);
-    if (!dateKey) return false;
-    return dateKey >= getMinimumDateKey(now) && dateKey <= getDateKey(now);
+    const updatedAt = threadUpdatedAt(thread);
+    const minimumDate = parseDateKey(getMinimumDateKey(now));
+    minimumDate?.setHours(0, 0, 0, 0);
+    return !!path && (
+      !!updatedAt && updatedAt >= (minimumDate?.getTime() || 0) ||
+      !!dateKey && dateKey >= getMinimumDateKey(now) && dateKey <= getDateKey(now)
+    );
   }
 
   async function listRecentSessionThreads() {
+    try {
+      const workspaceThreads = await listRecentWorkspaceSessionThreads();
+      if (workspaceThreads.length) return workspaceThreads;
+    } catch {
+      // Older Codex builds continue through the app-server dispatcher path.
+    }
+
     const threads = new Map();
     let lastError = "";
     for (const archived of [false, true]) {
@@ -3113,7 +3388,28 @@
   }
 
   async function readSessionText(path) {
-    const response = await sendCliRequest("fs/readFile", { path }, HISTORY_REQUEST_TIMEOUT_MS);
+    let workspaceError = null;
+    try {
+      const services = await resolveAppServices();
+      if (services?.workspaceFiles) {
+        const response = await services.workspaceFiles.read({
+          hostId: "local",
+          path,
+          representation: "text",
+          maxBytes: HISTORY_MAX_SESSION_BYTES,
+        });
+        if (typeof response?.text === "string") return response.text;
+      }
+    } catch (error) {
+      workspaceError = error;
+    }
+
+    let response = null;
+    try {
+      response = await sendCliRequest("fs/readFile", { path }, HISTORY_REQUEST_TIMEOUT_MS);
+    } catch (error) {
+      throw workspaceError || error;
+    }
     const dataBase64 =
       response?.dataBase64 ||
       response?.data_base64 ||
@@ -3140,17 +3436,23 @@
     return results;
   }
 
-  async function readThreadSessionUsage(thread) {
-    const path = threadPath(thread);
-    if (!path) return null;
-    const text = await readSessionText(path);
-    return parseSessionUsageFromJsonl(text, {
-      path,
-      dateKey: dateKeyFromSessionPath(path),
-      threadId: threadIdentity(thread),
-      model: extractDirectModel(thread),
-      timestamp: threadUpdatedAt(thread),
-    });
+  async function readThreadSessionUsages(thread) {
+    let lastError = null;
+    for (const path of threadPaths(thread)) {
+      try {
+        const text = await readSessionText(path);
+        return parseSessionUsagesFromJsonl(text, {
+          path,
+          threadId: threadIdentity(thread),
+          model: extractDirectModel(thread),
+          timestamp: threadUpdatedAt(thread),
+        });
+      } catch (error) {
+        lastError = error;
+        // Try the same thread under the next inferred home directory.
+      }
+    }
+    throw lastError || new Error("无法读取 session 文件");
   }
 
   async function runHistoryBackfill({ force = false } = {}) {
@@ -3165,34 +3467,44 @@
     render({ animate: false });
     try {
       const threads = await listRecentSessionThreads();
-      const usages = await mapLimit(threads, HISTORY_READ_CONCURRENCY, async (thread) => {
+      const threadReadResults = await mapLimit(threads, HISTORY_READ_CONCURRENCY, async (thread) => {
         try {
-          return await readThreadSessionUsage(thread);
+          return { read: true, usages: await readThreadSessionUsages(thread) };
         } catch {
-          return null;
+          return { read: false, usages: [] };
         }
       });
 
       let changed = false;
       let sessions = 0;
+      let filesRead = 0;
       let tokenCountEvents = 0;
       const historyDateKeys = new Set();
-      for (const usage of usages) {
-        if (!usage) continue;
+      for (const result of threadReadResults) {
+        if (result?.read) filesRead += 1;
+        const usages = result?.usages || [];
+        if (!usages?.length) continue;
         sessions += 1;
-        tokenCountEvents += toCount(usage.tokenCountEvents);
-        historyDateKeys.add(usage.dateKey);
-        changed = upsertHistorySessionUsage(usage) || changed;
+        for (const usage of usages) {
+          tokenCountEvents += toCount(usage.tokenCountEvents);
+          historyDateKeys.add(usage.dateKey);
+          changed = upsertHistorySessionUsage(usage) || changed;
+        }
       }
-      const captureTurnsPruned = pruneSupersededCaptureTurns(Array.from(historyDateKeys));
-      changed = captureTurnsPruned > 0 || changed;
+      const complete = threads.length > 0 && filesRead === threads.length;
+      if (complete) changed = markHistoryCoverageComplete(Array.from(historyDateKeys)) || changed;
+      const supersededTurnsPruned = pruneSupersededUsageTurns(Array.from(historyDateKeys));
+      changed = supersededTurnsPruned > 0 || changed;
 
       historyBackfillLastAt = Date.now();
       historyBackfillLastResult = {
         threads: threads.length,
+        filesRead,
         sessions,
+        complete,
         tokenCountEvents,
-        captureTurnsPruned,
+        captureTurnsPruned: supersededTurnsPruned,
+        supersededTurnsPruned,
         changed,
       };
       if (changed) {
@@ -3290,6 +3602,16 @@
     style = document.createElement("style");
     style.id = STYLE_ID;
     style.textContent = `
+      #${ROOT_ID},
+      #${PANEL_ID} {
+        --color-token-border: var(--color-border, rgba(127, 127, 127, 0.24));
+        --color-token-border-strong: var(--color-border-strong, rgba(127, 127, 127, 0.38));
+        --color-token-foreground: var(--color-text-foreground, #202020);
+        --color-token-foreground-secondary: var(--color-text-foreground-secondary, #737373);
+        --color-token-background: var(--color-background-panel, var(--color-background, #ffffff));
+        --color-token-background-secondary: var(--color-background-control, var(--color-background-surface, rgba(127, 127, 127, 0.08)));
+        --color-token-background-tertiary: var(--color-background-control-hover, rgba(127, 127, 127, 0.15));
+      }
       #${ROOT_ID} {
         position: relative;
         display: flex;
@@ -4032,6 +4354,27 @@
           opacity: 1;
         }
       }
+      html.electron-dark #${PANEL_ID} {
+        color-scheme: dark;
+        background: #202124;
+        color: #f2f2f2;
+      }
+      html.electron-dark #${PANEL_ID} .codex-daily-heading,
+      html.electron-dark #${PANEL_ID} .codex-daily-foot {
+        background: #202124;
+      }
+      html.electron-dark #${PANEL_ID} .codex-daily-price-model-input,
+      html.electron-dark #${PANEL_ID} .codex-daily-price-input {
+        color: #f2f2f2;
+        caret-color: #f2f2f2;
+        border-color: rgba(255, 255, 255, 0.18);
+        background: rgba(255, 255, 255, 0.1);
+      }
+      html.electron-dark #${PANEL_ID} .codex-daily-price-model-input::placeholder,
+      html.electron-dark #${PANEL_ID} .codex-daily-price-input::placeholder {
+        color: rgba(242, 242, 242, 0.48);
+        opacity: 1;
+      }
     `;
     (document.head || document.documentElement).appendChild(style);
   }
@@ -4707,6 +5050,15 @@
     layoutRaf = typeof window.requestAnimationFrame === "function" ? window.requestAnimationFrame(run) : window.setTimeout(run, 16);
   }
 
+  function scheduleDomToolScan(delayMs = 120) {
+    if (destroyed || domToolScanTimer) return;
+    domToolScanTimer = window.setTimeout(() => {
+      domToolScanTimer = null;
+      if (document.visibilityState === "hidden") return;
+      if (processDomToolCalls()) render({ animate: false });
+    }, Math.max(0, delayMs));
+  }
+
   function observeLayoutNode(node) {
     if (!node || resizeObservedNodes.has(node)) return;
     if (root?.contains(node) || panel?.contains(node)) return;
@@ -5006,7 +5358,7 @@
     const dateInput = panel.querySelector(".codex-daily-date-input");
     dateInput.min = getMinimumDateKey();
     dateInput.max = todayKey;
-    dateInput.value = selectedDateKey;
+    if (document.activeElement !== dateInput) dateInput.value = selectedDateKey;
     panel.querySelector('[data-action="previous-day"]').disabled =
       selectedDateKey <= dateInput.min;
     panel.querySelector('[data-action="next-day"]').disabled =
@@ -5080,6 +5432,7 @@
     if (pollTimer) window.clearInterval(pollTimer);
     if (midnightTimer) window.clearTimeout(midnightTimer);
     if (historyBackfillTimer) window.clearTimeout(historyBackfillTimer);
+    if (domToolScanTimer) window.clearTimeout(domToolScanTimer);
     if (closeTimer) window.clearTimeout(closeTimer);
     if (shareFeedbackTimer) window.clearTimeout(shareFeedbackTimer);
     if (layoutRaf) {
@@ -5145,11 +5498,21 @@
       getMinimumDateKey,
       dateKeyFromSessionPath,
       threadIdFromSessionPath,
+      bootstrapThreadIds,
+      bootstrapHomeDirectories,
+      sessionPathFromThreadId,
+      resolveAppServices,
+      listRecentWorkspaceSessionThreads,
+      cumulativeUsageDelta,
+      parseSessionUsagesFromJsonl,
       parseSessionUsageFromJsonl,
       upsertHistorySessionUsage,
       cumulativeUsageTurnId,
       removeLegacyCumulativeTurns,
       pruneSupersededCaptureTurns,
+      pruneSupersededUsageTurns,
+      historyCoverageTimestamp,
+      markHistoryCoverageComplete,
       pruneState,
       getTurnTimestamp,
       isUsageTurn,
@@ -5198,7 +5561,7 @@
 
     observer = new MutationObserver(() => {
       scheduleMountRoot();
-      if (processDomToolCalls()) render({ animate: false });
+      scheduleDomToolScan();
     });
     observer.observe(document.documentElement, {
       childList: true,
