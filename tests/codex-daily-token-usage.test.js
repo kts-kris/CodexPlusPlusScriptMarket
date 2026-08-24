@@ -1,6 +1,7 @@
 "use strict";
 
 const assert = require("node:assert/strict");
+const crypto = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
@@ -23,10 +24,18 @@ function createRuntime() {
   };
   const document = {
     readyState: "loading",
+    documentElement: { clientWidth: 1708 },
     addEventListener() {},
     removeEventListener() {},
   };
+  const getComputedStyle = (node) => node?.computedStyle || {
+    display: "block",
+    visibility: "visible",
+    opacity: "1",
+    position: "static",
+  };
   const window = {
+    innerWidth: 1708,
     localStorage,
     setTimeout,
     clearTimeout,
@@ -55,10 +64,11 @@ function createRuntime() {
       clearTimeout,
       setInterval,
       clearInterval,
+      getComputedStyle,
     }),
     { filename: scriptPath }
   );
-  return window.__codexDailyTokenUsage;
+  return { api: window.__codexDailyTokenUsage, document };
 }
 
 function tokenCountRow(timestamp, total, last, model = "") {
@@ -84,9 +94,10 @@ function tokenCountRow(timestamp, total, last, model = "") {
   return rows;
 }
 
-const api = createRuntime();
+const runtime = createRuntime();
+const api = runtime.api;
 const test = api.__test;
-assert.equal(api.version, "1.4.17");
+assert.equal(api.version, "1.4.18");
 
 const today = new Date();
 today.setHours(10, 0, 0, 0);
@@ -245,21 +256,119 @@ assert.equal(test.aggregateDayCached(todayKey).cacheHit, true);
 assert.equal(test.aggregateDay(todayKey).turns, 226);
 assert.equal(test.aggregateDay(todayKey).toolCallTotal, 314);
 
-const layout = test.resolveFloatingLayout(94, 31, 900, 600, [
+const dynamicObstacles = [
   { left: 518, top: 8, right: 665, bottom: 42 },
   { left: 690, top: 8, right: 820, bottom: 42 },
-]);
+];
+const layout = test.resolveFloatingLayout(94, 31, 900, 600, dynamicObstacles);
 assert.equal(layout.compact, false);
-assert.equal(test.rectsOverlap({ left: layout.left, right: layout.left + layout.width, top: layout.top, bottom: layout.top + 31 }, {
-  left: 518,
-  top: 8,
-  right: 665,
-  bottom: 42,
-}, 8), false);
+for (const obstacle of dynamicObstacles) {
+  assert.equal(
+    test.rectsOverlap(
+      { left: layout.left, right: layout.left + layout.width, top: layout.top, bottom: layout.top + 31 },
+      obstacle,
+      8
+    ),
+    false
+  );
+}
+
+function visibleNode(rect, options = {}) {
+  return {
+    ...options,
+    getBoundingClientRect() {
+      return rect;
+    },
+  };
+}
+
+const applicationMenuTopBar = visibleNode({ left: 0, top: 0, right: 1708, bottom: 36 });
+const legacyAppHeader = visibleNode({ left: 0, top: 0, right: 1708, bottom: 36 });
+const queriedHeaderSelectors = [];
+runtime.document.querySelector = (selector) => {
+  queriedHeaderSelectors.push(selector);
+  if (selector === '[class*="ApplicationMenuTopBar"]') return applicationMenuTopBar;
+  if (selector === ".app-header-tint") return legacyAppHeader;
+  if (selector === "header") throw new Error("conversation header must not be queried");
+  return null;
+};
+assert.equal(test.findAppHeaderElement(), applicationMenuTopBar);
+assert.deepEqual(queriedHeaderSelectors, ['[class*="ApplicationMenuTopBar"]']);
+
+const menuTopBar = visibleNode({ left: 0, top: 0, right: 1708, bottom: 36 });
+const menuBar = {
+  closest(selector) {
+    assert.equal(selector, '[class*="ApplicationMenuTopBar"]');
+    return menuTopBar;
+  },
+};
+runtime.document.querySelector = (selector) => {
+  if (selector === '[class*="ApplicationMenuTopBar"]') return null;
+  if (selector === '[role="menubar"]') return menuBar;
+  if (selector === ".app-header-tint") return legacyAppHeader;
+  if (selector === "header") throw new Error("conversation header must not be queried");
+  return null;
+};
+assert.equal(test.findAppHeaderElement(), menuTopBar);
+
+const hiddenApplicationMenuTopBar = visibleNode({ left: 0, top: 0, right: 0, bottom: 0 });
+runtime.document.querySelector = (selector) => {
+  if (selector === '[class*="ApplicationMenuTopBar"]') return hiddenApplicationMenuTopBar;
+  if (selector === ".app-header-tint") return legacyAppHeader;
+  if (selector === "header") throw new Error("conversation header must not be queried");
+  return null;
+};
+assert.equal(test.findAppHeaderElement(), legacyAppHeader);
+
+runtime.document.querySelector = (selector) => {
+  if (selector === ".app-header-tint") return legacyAppHeader;
+  if (selector === "header") throw new Error("conversation header must not be queried");
+  return null;
+};
+assert.equal(test.findAppHeaderElement(), legacyAppHeader);
+
+runtime.document.querySelector = (selector) => {
+  if (selector === "header") throw new Error("generic conversation header must not be queried");
+  return null;
+};
+const staticAppHeader = visibleNode(
+  { left: 0, top: 0, right: 1708, bottom: 46, width: 1708, height: 46 },
+  { computedStyle: { display: "flex", visibility: "visible", opacity: "1", position: "static" } }
+);
+const fixedAppHeader = visibleNode(
+  { left: 0, top: 0, right: 1708, bottom: 46, width: 1708, height: 46 },
+  { computedStyle: { display: "flex", visibility: "visible", opacity: "1", position: "fixed" } }
+);
+const conversationHeader = visibleNode(
+  { left: 1408, top: 68, right: 1708, bottom: 96, width: 300, height: 28 },
+  { computedStyle: { display: "flex", visibility: "visible", opacity: "1", position: "sticky" } }
+);
+runtime.document.querySelectorAll = (selector) => {
+  assert.equal(selector, "header.draggable");
+  return [conversationHeader, staticAppHeader, fixedAppHeader];
+};
+assert.equal(test.findAppHeaderElement(), fixedAppHeader);
+
+runtime.document.querySelectorAll = () => [conversationHeader];
+assert.equal(test.findAppHeaderElement(), null);
+
+const defaultLayout = test.resolveFloatingLayout(108, 31, 1708, 1020, [], []);
+assert.deepEqual(
+  JSON.parse(JSON.stringify(defaultLayout)),
+  { top: 2, right: 132, left: 1468, width: 108, compact: false }
+);
+assert.match(source, /const FLOATING_DEFAULT_RIGHT = WINDOW_BUTTON_SAFE_RIGHT;/);
+assert.doesNotMatch(source, /document\.querySelector\(["']header["']\)/);
 
 assert.match(source, /html\.electron-dark #\$\{PANEL_ID\}/);
 assert.match(source, /overflow-y: auto/);
 assert.match(source, /scheduleDomToolScan/);
+
+const index = JSON.parse(fs.readFileSync(path.resolve(__dirname, "../index.json"), "utf8"));
+const indexEntry = index.scripts.find((entry) => entry.id === "codex-daily-token-usage");
+const scriptSha256 = crypto.createHash("sha256").update(fs.readFileSync(scriptPath)).digest("hex");
+assert.equal(indexEntry.version, api.version);
+assert.equal(indexEntry.sha256, scriptSha256);
 
 api.destroy({ clearData: true });
 console.log("codex-daily-token-usage: assertions passed");
